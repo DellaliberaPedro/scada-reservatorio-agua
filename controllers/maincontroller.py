@@ -310,8 +310,13 @@ class MainController(QMainWindow):
     # Loop de telemetria
     # ------------------------------------------------------------------
     def atualizar_telemetria(self):
+        """Tique do simulador (só roda enquanto não há STM32 conectado)."""
         leitura = self.simulador.proxima_leitura()
+        self._processar_leitura(leitura)
+        self._checar_protecao_espontanea(leitura)
 
+    def _processar_leitura(self, leitura):
+        """Caminho único de uma leitura (simulada ou vinda do STM32): listas, tela, gráficos e limites."""
         self.tempos.append(leitura.timestamp)
         self.temperaturas.append(leitura.temperatura_c)
         self.tds_valores.append(leitura.tds_ppm)
@@ -320,7 +325,6 @@ class MainController(QMainWindow):
         self._atualizar_lcds(leitura)
         self._redesenhar_graficos()
         self._checar_setpoints(leitura)
-        self._checar_protecao_espontanea(leitura)
 
     def _atualizar_lcds(self, leitura):
         self.ui.lcd_temperatura.display(leitura.temperatura_c)
@@ -344,11 +348,16 @@ class MainController(QMainWindow):
         serie.replace([QPointF(t.timestamp() * 1000, v) for t, v in pares])
         tempos = [t for t, _ in pares]
         vals = [v for _, v in pares]
+        if tempos[0] == tempos[-1]:
+            return  # só 1 leitura até agora (começo da leitura real): ainda não há intervalo de tempo
         eixo_x.setRange(
             QDateTime.fromMSecsSinceEpoch(int(tempos[0].timestamp() * 1000)),
             QDateTime.fromMSecsSinceEpoch(int(tempos[-1].timestamp() * 1000)),
         )
-        eixo_y.setRange(min(vals) * 0.9, max(vals) * 1.1)
+        baixo, alto = min(vals) * 0.9, max(vals) * 1.1
+        if baixo == alto:  # valor constante igual a 0
+            baixo, alto = baixo - 1, alto + 1
+        eixo_y.setRange(baixo, alto)
 
     def _redesenhar_graficos(self):
         self._atualizar_grafico_detalhe(self.serie_temperatura, self.temperaturas, self.eixo_x_temp, self.eixo_y_temp)
@@ -368,6 +377,8 @@ class MainController(QMainWindow):
         self.serie_geral_turbidez.replace([QPointF(t.timestamp() * 1000, v) for t, v in pares_turbidez])
 
         tempos = [t for t, _ in pares_temp]
+        if tempos[0] == tempos[-1]:
+            return  # só 1 leitura até agora: ainda não há intervalo de tempo
         self.eixo_x_geral.setRange(
             QDateTime.fromMSecsSinceEpoch(int(tempos[0].timestamp() * 1000)),
             QDateTime.fromMSecsSinceEpoch(int(tempos[-1].timestamp() * 1000)),
@@ -607,7 +618,7 @@ class MainController(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(ARQUIVO_LOG)))
 
     # ------------------------------------------------------------------
-    # Painel serial (visual, sem conexao real ainda)
+    # Painel serial e leitura real (QThread + Worker)
     # ------------------------------------------------------------------
     def _aplicar_config_serial(self):
         """Preenche o painel serial com os valores salvos no config.json."""
