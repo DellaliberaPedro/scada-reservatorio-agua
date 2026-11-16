@@ -139,9 +139,9 @@ Thumbs.db
 
 | Tecnologia      |  Versão | Utilização                           |
 | --------------- | ------: | ------------------------------------ |
-| **PySide6**     | **6.x** | Desenvolvimento da interface gráfica |
-| **Qt**          | **6.x** | Framework da aplicação desktop       |
-| **Qt Designer** | **6.x** | Criação das interfaces `.ui`         |
+| **PySide6**     | **6.11.1** | Desenvolvimento da interface gráfica |
+| **Qt**          | **6.11.1** | Framework da aplicação desktop       |
+| **Qt Designer** | **6.11.1** | Criação das interfaces `.ui`         |
 
 ### 🔌 Hardware e firmware
 
@@ -157,9 +157,9 @@ Thumbs.db
 
 | Ferramenta             |  Versão | Utilização                     |
 | ---------------------- | ------: | ------------------------------ |
-| **Git**                | **2.x** | Controle de versão             |
+| **Git**                | **2.55.0** | Controle de versão             |
 | **GitHub**             |       — | Hospedagem do código-fonte     |
-| **Visual Studio Code** | **1.x** | Editor de código               |git status
-| **Qt Designer**        | **6.x** | Desenvolvimento das interfaces |
+| **Visual Studio Code** | **1.142.0** | Editor de código               |
+| **Qt Designer**        | **6.11.1** | Desenvolvimento das interfaces |
 
 > 📌 **Observação:** as versões indicadas correspondem às versões utilizadas ou previstas durante o desenvolvimento do projeto e podem ser atualizadas conforme a evolução da aplicação.
