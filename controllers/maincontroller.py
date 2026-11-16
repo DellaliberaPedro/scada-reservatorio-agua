@@ -11,7 +11,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
-from PySide6.QtCore import QDateTime, QPointF, QTimer, QUrl, Qt
+from PySide6.QtCore import QDateTime, QPointF, QThread, QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import QGraphicsView, QMainWindow, QMessageBox, QVBoxLayout
 
@@ -23,12 +23,20 @@ from models.dispositivo_repository import TAG_RELE_EMERGENCIA, TAG_VALVULA, Disp
 from models.evento_repository import EventoRepository
 from models.regra_repository import RegraRepository
 from models.logger import ARQUIVO_LOG
+from models.serial_worker import BAUD_PADRAO, MOTIVO_OPERADOR, SerialWorker
 from models.sensor_data import EstadoValvula, RegistroEvento, RegraAlerta, StatusDispositivo, TipoEvento
 from ui.Ui_tela import Ui_MainWindow
 
 HORAS_GRAFICO_DETALHE = 1
 HORAS_GRAFICO_GERAL = 24
 PROBABILIDADE_TRIP = 0.01
+OPCAO_AUTOMATICO = "Automático"  # o worker acha o STM32 sozinho
+
+# cores do texto de status da conexão serial
+COR_CONECTADO = "#27ae60"
+COR_PROCURANDO = "#e0a132"
+COR_DESCONECTADO = "#c0392b"
+
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +68,13 @@ class MainController(QMainWindow):
         self.estado_valvula = EstadoValvula.ABERTA
         self.id_valvula = None  # id da VALV-01 na tabela dispositivos (FK dos eventos)
 
+        # leitura serial: QThread + Worker (padrão da aula de 26/10). As referências ficam em
+        # atributos para o coletor de lixo não destruir os objetos enquanto a thread roda
+        self.thread_serial = None
+        self.worker_serial = None
+        self.modo_real = False  # False = dados simulados; True = dados vindos do STM32
+
+
         # cada lista guarda o historico completo (tempo + valor) de um sensor
         self.tempos = []
         self.temperaturas = []
@@ -83,6 +98,10 @@ class MainController(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.atualizar_telemetria)
         self.timer.start(self._intervalo_atualizacao_ms())
+
+        # assim que a janela aparece, procura a porta do STM32 sozinho (modo Automático)
+        QTimer.singleShot(0, self.iniciar_leitura_serial)
+
 
     # ------------------------------------------------------------------
     # Regras de alerta (SQLite)
@@ -630,31 +649,142 @@ class MainController(QMainWindow):
             if combo.findText(valor) < 0:  # porta/baud que nao esta na lista padrao
                 combo.addItem(valor)
             combo.setCurrentText(valor)
+
+        # 1ª opção do combo: "Automático" varre as portas e acha o STM32 sozinho.
+        # A porta salva no config.json continua na lista (para quem quiser fixar uma COM).
+        self.ui.combo_porta_com.insertItem(0, OPCAO_AUTOMATICO)
+        self.ui.combo_porta_com.setCurrentIndex(0)
+
         try:
             self.ui.spin_timeout.setValue(int(serial["timeout_s"]))
         except (TypeError, ValueError):
             logger.warning("timeout_s inválido no config.json: %r. Mantido o valor da tela.", serial["timeout_s"])
 
     def conectar_serial(self):
-        porta = self.ui.combo_porta_com.currentText()
-        baud = self.ui.combo_baud_rate.currentText()
-        timeout = self.ui.spin_timeout.value()
-
-        # a ultima configuracao usada fica salva para a proxima abertura do programa
-        if not self.config.atualizar_serial(porta, baud, timeout):
-            QMessageBox.warning(self, "Configuração", "Não foi possível salvar os parâmetros em config.json.")
-        self.ui.lbl_status_conexao.setText(f"Status: Conectado ({porta} @ {baud}, timeout {timeout}s)")
-        self.ui.lbl_status_conexao.setStyleSheet("font-weight: bold; color: #27ae60;")
-        self._log_evento(
-            TipoEvento.STATUS,
-            f"Conexão serial estabelecida (visual) — {porta}.",
-            f"{baud} bps, timeout {timeout}s",
-        )
+        """Botão Conectar: "Automático" varre as portas; uma COM escolhida no combo fica fixa."""
+        self.iniciar_leitura_serial()
 
     def desconectar_serial(self):
-        self.ui.lbl_status_conexao.setText("Status: Desconectado")
-        self.ui.lbl_status_conexao.setStyleSheet("font-weight: bold; color: #c0392b;")
-        self._log_evento(TipoEvento.STATUS, "Conexão serial encerrada (visual).", "-")
+        """Botão Desconectar: interrupção cooperativa; a QThread termina sozinha em instantes."""
+        self.parar_leitura_serial()
+
+    def iniciar_leitura_serial(self):
+        """Cria a QThread + SerialWorker (padrão da aula de 26/10) e começa a procurar o STM32."""
+        if self.thread_serial is not None:
+            self.statusBar().showMessage("A leitura serial já está em andamento (ou encerrando).", 4000)
+            return
+
+        escolha = self.ui.combo_porta_com.currentText()
+        porta_fixa = None if escolha == OPCAO_AUTOMATICO else escolha
+        try:
+            baud = int(self.ui.combo_baud_rate.currentText())
+        except ValueError:
+            baud = BAUD_PADRAO
+
+        self.thread_serial = QThread()
+        self.worker_serial = SerialWorker(
+            baud_rate=baud,
+            porta_fixa=porta_fixa,
+            timeout_sem_dados_s=self.ui.spin_timeout.value(),
+        )
+        self.worker_serial.moveToThread(self.thread_serial)
+
+        # o start da thread dispara o laço do Worker
+        self.thread_serial.started.connect(self.worker_serial.executar)
+
+        # Worker -> interface (estes slots rodam na GUI thread)
+        self.worker_serial.leitura_recebida.connect(self._processar_leitura)
+        self.worker_serial.conectado.connect(self._ao_conectar_serial)
+        self.worker_serial.desconectado.connect(self._ao_desconectar_serial)
+        self.worker_serial.status_msg.connect(self._ao_status_serial)
+        self.worker_serial.portas_atualizadas.connect(self._atualizar_combo_portas)
+        self.worker_serial.aviso.connect(self._ao_aviso_serial)
+        self.worker_serial.finalizado.connect(self._ao_finalizar_serial)
+
+        # ciclo de vida e liberação de memória (mesmo padrão da aula)
+        self.worker_serial.finalizado.connect(self.thread_serial.quit)
+        self.worker_serial.finalizado.connect(self.worker_serial.deleteLater)
+        self.thread_serial.finished.connect(self.thread_serial.deleteLater)
+        self.thread_serial.finished.connect(self._limpar_referencias_serial)
+
+        self._definir_status_conexao("Status: Procurando dispositivo...", COR_PROCURANDO)
+        self.thread_serial.start()
+
+    def parar_leitura_serial(self):
+        """Interrupção cooperativa: o worker só levanta a bandeira; nada de terminate()."""
+        if self.worker_serial is not None:
+            try:
+                self.worker_serial.parar()
+            except RuntimeError:
+                pass  # o worker já foi destruído pelo deleteLater
+
+    def _limpar_referencias_serial(self):
+        self.thread_serial = None
+        self.worker_serial = None
+
+    def _definir_status_conexao(self, texto, cor):
+        self.ui.lbl_status_conexao.setText(texto)
+        self.ui.lbl_status_conexao.setStyleSheet(f"font-weight: bold; color: {cor};")
+
+    def _atualizar_combo_portas(self, portas):
+        """Mantém o combo com as portas que o sistema está enxergando (sem mexer na escolha atual)."""
+        combo = self.ui.combo_porta_com
+        for porta in portas:
+            if combo.findText(porta) < 0:
+                combo.addItem(porta)
+
+    def _ao_status_serial(self, texto):
+        self._definir_status_conexao(f"Status: {texto}", COR_PROCURANDO)
+
+    def _ao_conectar_serial(self, porta, baud):
+        self._entrar_no_modo_real()
+        self._definir_status_conexao(f"Status: Conectado ({porta} @ {baud} bps)", COR_CONECTADO)
+        # a porta que realmente funcionou fica salva no config.json
+        if not self.config.atualizar_serial(porta, baud, self.ui.spin_timeout.value()):
+            self.statusBar().showMessage("Não foi possível salvar os parâmetros em config.json.", 6000)
+        self._log_evento(TipoEvento.STATUS, f"Conexão serial estabelecida — {porta}.", f"{baud} bps")
+
+    def _ao_desconectar_serial(self, motivo):
+        self._definir_status_conexao(f"Status: Desconectado — {motivo}", COR_DESCONECTADO)
+        if motivo == MOTIVO_OPERADOR:
+            self._log_evento(TipoEvento.STATUS, "Conexão serial encerrada pelo operador.", "-")
+        else:
+            self._log_evento(TipoEvento.ALERTA, f"Conexão serial perdida: {motivo}.", "-")
+
+    def _ao_aviso_serial(self, texto, eh_problema):
+        self.statusBar().showMessage(texto, 8000)
+        self._log_evento(TipoEvento.ALERTA if eh_problema else TipoEvento.STATUS, texto, "-")
+
+    def _ao_finalizar_serial(self):
+        self._definir_status_conexao("Status: Desconectado", COR_DESCONECTADO)
+
+    def _entrar_no_modo_real(self):
+        """Primeira conexão: desliga o simulador e limpa o histórico falso. Reconexões mantêm os dados."""
+        if self.modo_real:
+            return
+        self.timer.stop()
+        for lista in (self.tempos, self.temperaturas, self.tds_valores, self.turbidez_valores):
+            lista.clear()
+        for serie in (
+            self.serie_temperatura, self.serie_tds, self.serie_turbidez,
+            self.serie_geral_temperatura, self.serie_geral_tds, self.serie_geral_turbidez,
+        ):
+            serie.clear()
+        for lcd in (self.ui.lcd_temperatura, self.ui.lcd_tds, self.ui.lcd_turbidez, self.ui.lcd_iqa):
+            lcd.display(0)
+        self.modo_real = True
+        self._log_evento(TipoEvento.STATUS, "Leitura real ativada: simulador desligado.", "-")
+
+    def closeEvent(self, event):
+        """Fechar a janela: pede para o worker parar e espera a QThread acabar (aula de 26/10)."""
+        self.parar_leitura_serial()
+        if self.thread_serial is not None:
+            try:
+                self.thread_serial.quit()
+                self.thread_serial.wait(5000)
+            except RuntimeError:
+                pass  # a thread já foi destruída pelo deleteLater
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Historico
