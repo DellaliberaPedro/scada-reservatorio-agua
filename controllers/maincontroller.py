@@ -23,6 +23,7 @@ from models.dispositivo_repository import TAG_RELE_EMERGENCIA, TAG_VALVULA, Disp
 from models.evento_repository import EventoRepository
 from models.regra_repository import RegraRepository
 from models.logger import ARQUIVO_LOG
+from models.serial_protocol import CMD_RELE_OFF, CMD_RELE_ON, TipoEventoPlaca
 from models.serial_worker import BAUD_PADRAO, MOTIVO_OPERADOR, SerialWorker
 from models.sensor_data import EstadoValvula, RegistroEvento, RegraAlerta, StatusDispositivo, TipoEvento
 from ui.Ui_tela import Ui_MainWindow
@@ -31,6 +32,11 @@ HORAS_GRAFICO_DETALHE = 1
 HORAS_GRAFICO_GERAL = 24
 PROBABILIDADE_TRIP = 0.01
 OPCAO_AUTOMATICO = "Automático"  # o worker acha o STM32 sozinho
+TIMEOUT_CONFIRMACAO_MS = 3000  # tempo máximo esperando o "A,..." da placa depois de um comando
+# sensor como a placa escreve em "E,LIMITE,<sensor>" -> texto para o operador
+NOME_SENSOR_PLACA = {"TDS": "TDS", "TURBIDEZ": "Turbidez", "TEMPERATURA": "Temperatura"}
+# sensor da regra (tela/banco) -> sensor como a placa escreve no comando LIMITE,<sensor>,<valor>
+SENSOR_PLACA_POR_REGRA = {"TDS (ppm)": "TDS", "Turbidez (NTU)": "TURBIDEZ", "Temperatura (°C)": "TEMPERATURA"}
 
 # cores do texto de status da conexão serial
 COR_CONECTADO = "#27ae60"
@@ -73,6 +79,21 @@ class MainController(QMainWindow):
         self.thread_serial = None
         self.worker_serial = None
         self.modo_real = False  # False = dados simulados; True = dados vindos do STM32
+        self.placa_conectada = False  # True enquanto a porta do STM32 está aberta e confirmada
+
+        # comando enviado à placa que ainda espera o "A,..." de confirmação (None = nada pendente).
+        # A tela e o banco só mudam DEPOIS da confirmação: nunca mostra "cortado" com a bomba ligada.
+        self._pendente = None
+        self.timer_confirmacao = QTimer(self)
+        self.timer_confirmacao.setSingleShot(True)
+        self.timer_confirmacao.timeout.connect(self._ao_timeout_confirmacao)
+
+        # limites enviados à placa que ainda esperam o "A,LIMITE,..." (sensor da placa -> valor)
+        self._limites_pendentes = {}
+        self._limites_enviados = {}
+        self.timer_limites = QTimer(self)
+        self.timer_limites.setSingleShot(True)
+        self.timer_limites.timeout.connect(self._ao_timeout_limites)
 
 
         # cada lista guarda o historico completo (tempo + valor) de um sensor
@@ -138,10 +159,16 @@ class MainController(QMainWindow):
         return next((r for r in self.regras if r.sensor == sensor and r.ativa), None)
 
     def _sincronizar_spinboxes(self):
-        """Os spinboxes do dashboard mostram (e editam) a 1a regra ativa de TDS e de Turbidez."""
-        for sensor, spin in (("TDS (ppm)", self.ui.spin_limite_tds), ("Turbidez (NTU)", self.ui.spin_limite_turbidez)):
+        """Os spinboxes do dashboard mostram (e editam) a 1a regra ativa de TDS, de Turbidez e de Temperatura."""
+        spins = (
+            ("TDS (ppm)", self.ui.spin_limite_tds),
+            ("Turbidez (NTU)", self.ui.spin_limite_turbidez),
+            ("Temperatura (°C)", self.ui.spin_limite_temperatura),
+        )
+        for sensor, spin in spins:
             regra = self._primeira_regra_ativa(sensor)
             spin.setEnabled(regra is not None)
+            spin.setToolTip("" if regra is not None else "Sem regra ativa deste sensor. Crie uma em Configurar Regras de Alerta.")
             if regra is not None:
                 spin.setValue(regra.valor_maximo)
 
@@ -175,6 +202,7 @@ class MainController(QMainWindow):
             f"Limite de {sensor} alterado de {valor_anterior:.2f} para {novo_valor:.2f}.",
             f"{novo_valor:.2f}",
         )
+        self._enviar_limites_para_placa()
 
     def _intervalo_atualizacao_ms(self):
         try:
@@ -299,6 +327,9 @@ class MainController(QMainWindow):
         self.ui.spin_limite_turbidez.editingFinished.connect(
             lambda: self._alterar_limite_rapido("Turbidez (NTU)", self.ui.spin_limite_turbidez)
         )
+        self.ui.spin_limite_temperatura.editingFinished.connect(
+            lambda: self._alterar_limite_rapido("Temperatura (°C)", self.ui.spin_limite_temperatura)
+        )
 
     def abrir_configuracoes(self):
         dialogo = SettingsController(self.regras, parent=self)
@@ -320,6 +351,7 @@ class MainController(QMainWindow):
         self._log_evento(
             TipoEvento.COMANDO, f"Regras de alerta atualizadas via configuração ({len(self.regras)} regras).", "-"
         )
+        self._enviar_limites_para_placa()
 
     def abrir_historico(self):
         dialogo = HistoricoController(parent=self)
@@ -478,10 +510,15 @@ class MainController(QMainWindow):
         )
         self._atualizar_botoes_valvula()
 
+    @staticmethod
+    def _texto_leitura(tds, turbidez, temperatura):
+        """Texto da coluna 'Valor Medido' do histórico: as três grandezas medidas."""
+        return f"TDS {tds:.1f} ppm / Turbidez {turbidez:.2f} NTU / Temp {temperatura:.1f} °C"
+
     def _resumo_ultima_leitura(self):
         if not self.tds_valores:
             return "-"
-        return f"TDS {self.tds_valores[-1]:.1f} ppm / Turbidez {self.turbidez_valores[-1]:.2f} NTU"
+        return self._texto_leitura(self.tds_valores[-1], self.turbidez_valores[-1], self.temperaturas[-1])
 
     def _mudar_estado_valvula(self, estado_destino, tipo_evento, motivo, valor, simular_falha=False):
         """
@@ -546,14 +583,13 @@ class MainController(QMainWindow):
         ):
             self._fechar_valvula(
                 "Disparo espontâneo detectado no hardware (simulado).",
-                f"TDS {leitura.tds_ppm:.1f} ppm / Turbidez {leitura.turbidez_ntu:.2f} NTU",
+                self._texto_leitura(leitura.tds_ppm, leitura.turbidez_ntu, leitura.temperatura_c),
                 avisar=True,
             )
 
     def _fechar_valvula(self, motivo, valor, avisar, simular_falha=False):
         tipo = TipoEvento.ALERTA if avisar else TipoEvento.COMANDO
-        if self._mudar_estado_valvula(EstadoValvula.FECHADA, tipo, motivo, valor, simular_falha) and avisar:
-            QMessageBox.warning(self, "Proteção Ativada", motivo)
+        self._solicitar_estado(EstadoValvula.FECHADA, tipo, motivo, valor, avisar, simular_falha)
 
     def acionar_corte_emergencial(self):
         resposta = QMessageBox.question(
@@ -565,6 +601,8 @@ class MainController(QMainWindow):
         )
         if resposta != QMessageBox.Yes:
             return
+        if self.estado_valvula != EstadoValvula.ABERTA:
+            return  # a placa já cortou enquanto a caixa de confirmação estava aberta
 
         simular = self.acao_simular_falha.isChecked()
         self._fechar_valvula(
@@ -586,7 +624,9 @@ class MainController(QMainWindow):
         )
         if resposta != QMessageBox.Yes:
             return
-        self._mudar_estado_valvula(
+        if self.estado_valvula != EstadoValvula.FECHADA:
+            return  # já está aberta (mudou enquanto a caixa de confirmação estava aberta)
+        self._solicitar_estado(
             EstadoValvula.ABERTA,
             TipoEvento.COMANDO,
             "Válvula reaberta manualmente via software.",
@@ -595,8 +635,245 @@ class MainController(QMainWindow):
 
     def _atualizar_botoes_valvula(self):
         aberta = self.estado_valvula == EstadoValvula.ABERTA
-        self.ui.btn_emergencia.setEnabled(aberta)
-        self.ui.btn_abrir_valvula.setEnabled(not aberta)
+        livre = self._pendente is None  # esperando a placa responder, nenhum dos dois botões vale
+        self.ui.btn_emergencia.setEnabled(aberta and livre)
+        self.ui.btn_abrir_valvula.setEnabled(not aberta and livre)
+
+    # ------------------------------------------------------------------
+    # Comandos para a placa (RELE_ON / RELE_OFF) e eventos que ela manda
+    # ------------------------------------------------------------------
+    def _solicitar_estado(self, estado_destino, tipo_evento, motivo, valor, avisar=False, simular_falha=False):
+        """
+        Ponto único para ligar/desligar a bomba (corte, reabertura e proteção).
+          - Placa conectada: manda RELE_OFF/RELE_ON e SÓ muda a tela e o banco quando o "A,..." chegar
+            (ou o timeout avisa que a placa não respondeu).
+          - Nunca conectou (modo simulado): muda direto, como era antes de existir a placa.
+          - Já usou a placa, mas ela está desconectada: avisa; não finge que cortou.
+        Devolve True se a ação foi feita (simulado) ou enviada à placa (aguardando a confirmação).
+        """
+        if not self.placa_conectada:
+            if self.modo_real:
+                QMessageBox.warning(
+                    self,
+                    "Sem conexão com a placa",
+                    "A placa não está conectada, então o comando não foi enviado.\n"
+                    "O estado mostrado não foi alterado. Em emergência, use o botão físico.",
+                )
+                return False
+            ok = self._mudar_estado_valvula(estado_destino, tipo_evento, motivo, valor, simular_falha)
+            if ok and avisar:
+                QMessageBox.warning(self, "Proteção Ativada", motivo)
+            return ok
+
+        if self._pendente is not None:
+            self.statusBar().showMessage("Aguardando a confirmação do comando anterior...", 4000)
+            return False
+
+        comando = CMD_RELE_OFF if estado_destino == EstadoValvula.FECHADA else CMD_RELE_ON
+        if not self._enviar_comando_placa(comando):
+            QMessageBox.critical(
+                self,
+                "Falha ao enviar o comando",
+                f"Não foi possível enviar {comando} para a placa.\nO estado mostrado não foi alterado.",
+            )
+            return False
+
+        self._pendente = {
+            "comando": comando,
+            "estado": estado_destino,
+            "tipo": tipo_evento,
+            "motivo": motivo,
+            "valor": valor,
+            "avisar": avisar,
+            "simular_falha": simular_falha,
+        }
+        self.timer_confirmacao.start(TIMEOUT_CONFIRMACAO_MS)
+        self._atualizar_botoes_valvula()
+        self.statusBar().showMessage(f"Comando {comando} enviado. Aguardando a placa...", TIMEOUT_CONFIRMACAO_MS)
+        return True
+
+    def _enviar_comando_placa(self, comando):
+        if self.worker_serial is None:
+            return False
+        try:
+            return self.worker_serial.enviar_comando(comando)
+        except RuntimeError:  # o worker já foi destruído pelo deleteLater
+            return False
+
+    def _cancelar_pendencia(self):
+        self.timer_confirmacao.stop()
+        self._pendente = None
+        self._atualizar_botoes_valvula()
+
+    def _ao_confirmacao_serial(self, comando):
+        """A placa respondeu "A,<comando>": agora sim a tela e o banco mudam (uma única transação)."""
+        pendente = self._pendente
+        if pendente is None or pendente["comando"] != comando:
+            logger.info("Placa confirmou %s sem comando pendente: ignorado.", comando)
+            return
+        self._cancelar_pendencia()
+        ok = self._mudar_estado_valvula(
+            pendente["estado"], pendente["tipo"], pendente["motivo"], pendente["valor"], pendente["simular_falha"]
+        )
+        if ok:
+            if pendente["avisar"]:
+                QMessageBox.warning(self, "Proteção Ativada", pendente["motivo"])
+            return
+        # a placa JÁ executou o comando: a tela segue o hardware, mesmo que o banco tenha dado rollback
+        self._aplicar_estado_valvula(pendente["estado"])
+        self.statusBar().showMessage(
+            "ATENÇÃO: a placa executou o comando, mas o registro no banco falhou (rollback).", 10000
+        )
+
+    def _ao_evento_placa(self, evento):
+        """Linha "E,...": a placa fez algo por conta própria (corte por limite ou botão) ou recusou um comando."""
+        if evento.tipo == TipoEventoPlaca.BLOQUEADO:
+            self._ao_reabertura_recusada()
+            return
+
+        if evento.tipo == TipoEventoPlaca.LIMITE:
+            nome = NOME_SENSOR_PLACA.get(evento.sensor, evento.sensor)
+            motivo = f"Corte automático da placa: {nome} acima do limite."
+        else:  # TipoEventoPlaca.BOTAO
+            motivo = "Corte de emergência acionado no botão físico da placa."
+        valor = self._resumo_ultima_leitura()
+
+        self._cancelar_pendencia()  # a placa já cortou: o comando que esperava resposta perdeu o sentido
+        if self.estado_valvula == EstadoValvula.FECHADA:
+            self._log_evento(TipoEvento.ALERTA, f"{motivo} (a bomba já constava como desligada)", valor)
+            return
+
+        # mudança espontânea no hardware: caixa de aviso + registro automático (exigência do enunciado)
+        if self._mudar_estado_valvula(EstadoValvula.FECHADA, TipoEvento.ALERTA, motivo, valor):
+            QMessageBox.warning(self, "Proteção Ativada", motivo)
+        else:
+            self._aplicar_estado_valvula(EstadoValvula.FECHADA)  # a placa já cortou, a tela segue o hardware
+
+    def _ao_reabertura_recusada(self):
+        """"E,BLOQUEADO": a placa não religou a bomba (leitura acima do limite ou botão apertado)."""
+        pendente = self._pendente
+        if pendente is None or pendente["comando"] != CMD_RELE_ON:
+            logger.info("E,BLOQUEADO sem RELE_ON pendente: ignorado.")
+            return
+        self._cancelar_pendencia()
+        texto = (
+            "A placa recusou religar a bomba: alguma leitura está acima do limite "
+            "ou o botão de emergência está apertado."
+        )
+        self._log_evento(TipoEvento.ALERTA, texto, self._resumo_ultima_leitura())
+        QMessageBox.warning(self, "Reabertura recusada", f"{texto}\n\nCorrija a causa e tente reabrir de novo.")
+
+    def _ao_timeout_confirmacao(self):
+        """A placa não respondeu ao comando dentro do prazo: a tela NÃO muda e o operador é avisado."""
+        pendente = self._pendente
+        if pendente is None:
+            return
+        self._cancelar_pendencia()
+        comando = pendente["comando"]
+        texto = (
+            f"A placa não confirmou o comando {comando} em {TIMEOUT_CONFIRMACAO_MS // 1000} s. "
+            "O estado mostrado NÃO foi alterado."
+        )
+        self._log_evento(TipoEvento.ALERTA, texto, "-")
+        extra = ""
+        if comando == CMD_RELE_OFF:
+            extra = "\n\nATENÇÃO: a bomba pode continuar ligada. Use o botão físico de emergência."
+        QMessageBox.critical(self, "Sem confirmação da placa", f"{texto}\n\nConfira o cabo USB.{extra}")
+
+    # ------------------------------------------------------------------
+    # Limites de corte na placa (a placa corta sozinha; a tela só diz quais são os limites)
+    # ------------------------------------------------------------------
+    def _limites_efetivos(self):
+        """Limite de cada sensor na placa = a MENOR regra ativa daquele sensor (a mais exigente)."""
+        limites = {}
+        for regra in self.regras:
+            sensor = SENSOR_PLACA_POR_REGRA.get(regra.sensor)
+            if not regra.ativa or sensor is None:
+                continue
+            atual = limites.get(sensor)
+            limites[sensor] = regra.valor_maximo if atual is None else min(atual, regra.valor_maximo)
+        return limites
+
+    def _enviar_limites_para_placa(self):
+        """
+        Manda à placa os limites das regras ativas (ao conectar, ao mudar o spinbox e ao salvar as
+        Configurações). Sensor sem regra ativa não é enviado: a placa mantém o limite que já tinha.
+        Só com a placa conectada; ao conectar, os limites são enviados de novo.
+        """
+        if not self.placa_conectada or self.worker_serial is None:
+            return
+        enviados, falhas = {}, []
+        for sensor, valor in self._limites_efetivos().items():
+            try:
+                ok = self.worker_serial.enviar_limite(sensor, valor)
+            except ValueError as erro:  # fora da faixa que a placa aceita
+                logger.error("Limite de %s não enviado à placa: %s", sensor, erro)
+                ok = False
+            except RuntimeError:  # o worker já foi destruído pelo deleteLater
+                ok = False
+            if ok:
+                enviados[sensor] = round(valor, 2)
+            else:
+                falhas.append(NOME_SENSOR_PLACA[sensor])
+        if falhas:
+            self.statusBar().showMessage(f"Não foi possível enviar à placa o limite de: {', '.join(falhas)}.", 8000)
+        if not enviados:
+            return
+        self._limites_pendentes = dict(enviados)
+        self._limites_enviados = dict(enviados)
+        self.timer_limites.start(TIMEOUT_CONFIRMACAO_MS)
+        self.statusBar().showMessage("Limites enviados à placa. Aguardando a confirmação...", TIMEOUT_CONFIRMACAO_MS)
+
+    def _ao_limite_confirmado(self, sensor, valor):
+        """A placa respondeu "A,LIMITE,<sensor>,<valor>": quando todos chegarem, avisa e registra no histórico."""
+        esperado = self._limites_pendentes.get(sensor)
+        if esperado is None or abs(esperado - valor) > 0.011:
+            logger.info("Confirmação de limite ignorada (%s = %.2f): não era a esperada.", sensor, valor)
+            return
+        del self._limites_pendentes[sensor]
+        if self._limites_pendentes:
+            return
+        self.timer_limites.stop()
+        resumo = ", ".join(f"{NOME_SENSOR_PLACA[s]} {v:.2f}" for s, v in self._limites_enviados.items())
+        self.statusBar().showMessage(f"Limites aplicados na placa: {resumo}", 6000)
+        self._log_evento(TipoEvento.STATUS, f"Placa confirmou os limites de corte: {resumo}.", "-")
+
+    def _ao_timeout_limites(self):
+        """A placa não confirmou algum limite no prazo (firmware antigo, sem o comando LIMITE?)."""
+        if not self._limites_pendentes:
+            return
+        nomes = ", ".join(NOME_SENSOR_PLACA[s] for s in self._limites_pendentes)
+        self._limites_pendentes = {}
+        texto = (
+            f"A placa não confirmou o limite de {nomes} em {TIMEOUT_CONFIRMACAO_MS // 1000} s. "
+            "Ela continua cortando com os limites que já tinha."
+        )
+        self._log_evento(TipoEvento.ALERTA, texto, "-")
+        QMessageBox.warning(
+            self,
+            "Limites não aplicados na placa",
+            f"{texto}\n\nConfira se o firmware gravado é a v4 (a que entende o comando LIMITE).",
+        )
+
+    def _cancelar_limites_pendentes(self):
+        self.timer_limites.stop()
+        self._limites_pendentes = {}
+
+    def _sincronizar_bomba_ao_conectar(self):
+        """
+        A placa sempre liga com o relé solto (bomba desligada). Para a tela nunca mostrar "ABERTA" com a
+        bomba parada (nem o contrário, se o SCADA reconectou com a placa ligada), ao conectar o SCADA
+        assume o estado seguro: manda RELE_OFF. Para ligar de novo é preciso REABRIR (com confirmação).
+        """
+        if self.estado_valvula == EstadoValvula.ABERTA:
+            self._solicitar_estado(
+                EstadoValvula.FECHADA,
+                TipoEvento.STATUS,
+                "Bomba desligada ao conectar com a placa (estado seguro). Use REABRIR para ligar.",
+                self._resumo_ultima_leitura(),
+            )
+        else:
+            self._enviar_comando_placa(CMD_RELE_OFF)  # a tela já mostra FECHADA: só garante a bomba parada
 
     # ------------------------------------------------------------------
     # Menu Diagnostico (demonstracao de falhas na arguicao)
@@ -694,6 +971,9 @@ class MainController(QMainWindow):
 
         # Worker -> interface (estes slots rodam na GUI thread)
         self.worker_serial.leitura_recebida.connect(self._processar_leitura)
+        self.worker_serial.confirmacao_recebida.connect(self._ao_confirmacao_serial)
+        self.worker_serial.evento_placa.connect(self._ao_evento_placa)
+        self.worker_serial.limite_confirmado.connect(self._ao_limite_confirmado)
         self.worker_serial.conectado.connect(self._ao_conectar_serial)
         self.worker_serial.desconectado.connect(self._ao_desconectar_serial)
         self.worker_serial.status_msg.connect(self._ao_status_serial)
@@ -738,14 +1018,23 @@ class MainController(QMainWindow):
 
     def _ao_conectar_serial(self, porta, baud):
         self._entrar_no_modo_real()
+        self.placa_conectada = True
         self._definir_status_conexao(f"Status: Conectado ({porta} @ {baud} bps)", COR_CONECTADO)
         # a porta que realmente funcionou fica salva no config.json
         if not self.config.atualizar_serial(porta, baud, self.ui.spin_timeout.value()):
             self.statusBar().showMessage("Não foi possível salvar os parâmetros em config.json.", 6000)
         self._log_evento(TipoEvento.STATUS, f"Conexão serial estabelecida — {porta}.", f"{baud} bps")
+        self._sincronizar_bomba_ao_conectar()
+        self._enviar_limites_para_placa()
 
     def _ao_desconectar_serial(self, motivo):
+        self.placa_conectada = False
+        self._cancelar_limites_pendentes()
         self._definir_status_conexao(f"Status: Desconectado — {motivo}", COR_DESCONECTADO)
+        if self._pendente is not None:  # a conexão caiu antes do "A,...": a tela continua como estava
+            comando = self._pendente["comando"]
+            self._cancelar_pendencia()
+            self._log_evento(TipoEvento.ALERTA, f"Conexão perdida antes da placa confirmar {comando}.", "-")
         if motivo == MOTIVO_OPERADOR:
             self._log_evento(TipoEvento.STATUS, "Conexão serial encerrada pelo operador.", "-")
         else:
@@ -756,6 +1045,10 @@ class MainController(QMainWindow):
         self._log_evento(TipoEvento.ALERTA if eh_problema else TipoEvento.STATUS, texto, "-")
 
     def _ao_finalizar_serial(self):
+        self.placa_conectada = False
+        self._cancelar_limites_pendentes()
+        if self._pendente is not None:
+            self._cancelar_pendencia()
         self._definir_status_conexao("Status: Desconectado", COR_DESCONECTADO)
 
     def _entrar_no_modo_real(self):

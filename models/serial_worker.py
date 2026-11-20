@@ -15,6 +15,7 @@ Ciclo de vida do executar():
         -> cabo saiu (SerialException) ou parou de chegar dado? fecha, avisa e volta a varrer
 """
 import logging
+import threading
 import time
 
 import serial
@@ -23,10 +24,17 @@ from PySide6.QtCore import QObject, Signal
 from serial import SerialException
 
 from models.serial_protocol import (
+    COMANDOS_VALIDOS,
     LinhaInvalida,
     SensorSemLeitura,
+    eh_linha_de_confirmacao,
+    eh_linha_de_evento,
     eh_linha_de_leitura,
+    interpretar_confirmacao,
+    interpretar_confirmacao_limite,
+    interpretar_evento,
     interpretar_leitura,
+    montar_comando_limite,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,7 +43,8 @@ BAUD_PADRAO = 115200
 VID_STM32 = 0x0483  # fabricante (STMicroelectronics) do "Virtual COM Port" USB da Blue Pill
 
 TIMEOUT_LEITURA_S = 1.0        # readline() espera no máximo 1 s (igual aos exemplos da aula)
-ESTABILIZACAO_S = 2.0          # pausa depois de abrir a porta (aula: DTR/bootloader; no STM32: o USB reenumera)
+TIMEOUT_ESCRITA_S = 1.0        # write() nunca pode travar a tela se a porta engasgar
+ESTABILIZACAO_S = 2.0         # pausa depois de abrir a porta (aula: DTR/bootloader; no STM32: o USB reenumera)
 CONFIRMACAO_S = 6.0            # tempo para chegar uma linha "L," e provar que a porta é a do STM32
 INTERVALO_VARREDURA_S = 2.0    # pausa entre varreduras enquanto não há dispositivo
 PASSO_ESPERA_S = 0.1           # as esperas são fatiadas: o botão Desconectar responde rápido
@@ -52,6 +61,9 @@ class SerialWorker(QObject):
     conectado = Signal(str, int)       # porta, baud
     desconectado = Signal(str)         # motivo
     leitura_recebida = Signal(object)  # LeituraTelemetria
+    confirmacao_recebida = Signal(str)  # "RELE_ON" / "RELE_OFF" (linha "A,...": a placa executou o comando)
+    evento_placa = Signal(object)      # EventoPlaca (linha "E,...": a placa avisou sozinha)
+    limite_confirmado = Signal(str, float)  # sensor, valor (linha "A,LIMITE,<sensor>,<valor>": a placa aplicou o limite)
     aviso = Signal(str, bool)          # texto, é_problema (True = alerta, False = informação)
     finalizado = Signal()
 
@@ -64,6 +76,9 @@ class SerialWorker(QObject):
         self._descartadas = set()  # portas que abriram mas NÃO são o STM32 (não reabrir outros aparelhos a cada varredura)
         self._ultimas_portas = None
         self._sem_sensor_temp = False
+        # porta aberta e confirmada, visível para enviar_comando() (que roda na GUI thread)
+        self._trava_conexao = threading.Lock()
+        self._conexao_ativa = None
 
     # ------------------------------------------------------------------
     # Controle (chamado pela janela)
@@ -71,6 +86,46 @@ class SerialWorker(QObject):
     def parar(self):
         """Interrupção cooperativa (aula 26/10): só levanta a bandeira; o laço de executar() sai sozinho."""
         self._parar = True
+
+    def enviar_comando(self, comando):
+        """
+        Manda 'COMANDO\\n' para o STM32 (RELE_ON / RELE_OFF). Chamado pela GUI thread.
+
+        O laço de executar() fica preso em readline(), então não dá para pedir o envio por sinal:
+        a escrita é feita aqui mesmo, direto na porta. O pyserial aceita ler numa thread e escrever
+        noutra. Este método só escreve: nenhum widget é tocado (regra do Worker, aula de 26/10).
+        Devolve False se não há porta conectada ou se a escrita falhou.
+        """
+        if comando not in COMANDOS_VALIDOS:
+            raise ValueError(f"comando desconhecido: {comando!r}")
+        return self._escrever_linha(comando)
+
+    def enviar_limite(self, sensor, valor):
+        """
+        Manda 'LIMITE,<sensor>,<valor>\\n': muda o limite de corte daquele sensor na placa.
+        Levanta ValueError se o sensor ou o valor seriam recusados pela placa. Devolve False se não há
+        porta conectada ou se a escrita falhou. A confirmação chega depois, no sinal limite_confirmado.
+        """
+        return self._escrever_linha(montar_comando_limite(sensor, valor))
+
+    def _escrever_linha(self, linha):
+        with self._trava_conexao:
+            conexao = self._conexao_ativa
+            if conexao is None:
+                return False
+            try:
+                conexao.write(f"{linha}\n".encode("ascii"))
+                conexao.flush()
+            except (SerialException, OSError) as erro:
+                logger.warning("Falha ao enviar %s para %s: %s", linha, conexao.port, erro)
+                return False
+        logger.info("Comando enviado ao STM32: %s", linha)
+        return True
+
+    def _definir_conexao_ativa(self, conexao):
+        """Publica (ou retira, com None) a porta que enviar_comando() pode usar."""
+        with self._trava_conexao:
+            self._conexao_ativa = conexao
 
     # ------------------------------------------------------------------
     # Laço principal (roda na QThread)
@@ -86,17 +141,21 @@ class SerialWorker(QObject):
                         self._esperar(INTERVALO_VARREDURA_S)
                         continue
 
+                    self._definir_conexao_ativa(conexao)  # a partir daqui a GUI já pode mandar comandos
                     self.conectado.emit(conexao.port, self._baud)
                     motivo = self._ler_ate_perder(conexao)
+                    self._definir_conexao_ativa(None)  # antes de fechar: ninguém escreve numa porta fechada
                     self._fechar(conexao)
                     self.desconectado.emit(motivo)
                 except Exception as erro:  # um bug aqui não pode matar a leitura em silêncio
                     logger.exception("Erro inesperado no worker serial: %s", erro)
                     self.aviso.emit(f"Erro inesperado na leitura serial: {erro}", True)
+                    self._definir_conexao_ativa(None)
                     if conexao is not None:
                         self._fechar(conexao)
                     self._esperar(INTERVALO_VARREDURA_S)
         finally:
+            self._definir_conexao_ativa(None)
             self.finalizado.emit()
 
     # ------------------------------------------------------------------
@@ -143,7 +202,9 @@ class SerialWorker(QObject):
         dispositivo = info.device
         self.status_msg.emit(f"Testando {dispositivo} ({info.description})...")
         try:
-            conexao = serial.Serial(port=dispositivo, baudrate=self._baud, timeout=TIMEOUT_LEITURA_S)
+            conexao = serial.Serial(
+                port=dispositivo, baudrate=self._baud, timeout=TIMEOUT_LEITURA_S, write_timeout=TIMEOUT_ESCRITA_S
+            )
         except SerialException as erro:
             logger.warning("Não foi possível abrir %s: %s", dispositivo, erro)
             self.status_msg.emit(f"{dispositivo} ocupada ou sem acesso. Feche o Monitor Serial/Hercules.")
@@ -202,6 +263,8 @@ class SerialWorker(QObject):
                 continue
 
             reconhecida, leitura = self._interpretar(texto)
+            if not reconhecida:
+                reconhecida = self._tratar_mensagem_da_placa(texto)  # "A,..." ou "E,..."
             if reconhecida:
                 ultimo_dado = time.monotonic()
             if leitura is not None:
@@ -237,6 +300,31 @@ class SerialWorker(QObject):
             self._sem_sensor_temp = False
             self.aviso.emit("Sensor de temperatura voltou a responder.", False)
         return True, leitura
+
+    def _tratar_mensagem_da_placa(self, texto):
+        """
+        Linhas "A,..." (confirmação de um comando nosso) e "E,..." (evento espontâneo da placa).
+        Só emite sinais; quem decide o que fazer é o controller, na GUI thread.
+        Devolve True se a linha era uma mensagem válida da placa (conta como "o STM32 está vivo").
+        """
+        try:
+            if eh_linha_de_confirmacao(texto):
+                try:
+                    comando = interpretar_confirmacao(texto)  # "A,RELE_ON" / "A,RELE_OFF"
+                except LinhaInvalida:
+                    confirmacao = interpretar_confirmacao_limite(texto)  # "A,LIMITE,<sensor>,<valor>" (ou lixo: levanta)
+                    self.limite_confirmado.emit(confirmacao.sensor, confirmacao.valor)
+                    return True
+                self.confirmacao_recebida.emit(comando)
+                return True
+            if eh_linha_de_evento(texto):
+                evento = interpretar_evento(texto)
+                logger.info("Evento da placa: %s", texto)
+                self.evento_placa.emit(evento)
+                return True
+        except LinhaInvalida as erro:
+            logger.debug("Linha serial descartada: %s", erro)
+        return False
 
     # ------------------------------------------------------------------
     # Utilidades

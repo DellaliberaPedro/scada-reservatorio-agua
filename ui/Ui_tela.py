@@ -149,15 +149,27 @@ class Ui_MainWindow(object):
 
         self.spin_limite_turbidez = QDoubleSpinBox(self.group_setpoints)
         self.spin_limite_turbidez.setObjectName(u"spin_limite_turbidez")
-        self.spin_limite_turbidez.setMaximum(100.000000000000000)
+        self.spin_limite_turbidez.setMaximum(1000.000000000000000)
         self.spin_limite_turbidez.setValue(5.000000000000000)
 
         self.form_setpoints.setWidget(1, QFormLayout.ItemRole.FieldRole, self.spin_limite_turbidez)
 
+        self.lbl_limite_temperatura = QLabel(self.group_setpoints)
+        self.lbl_limite_temperatura.setObjectName(u"lbl_limite_temperatura")
+
+        self.form_setpoints.setWidget(2, QFormLayout.ItemRole.LabelRole, self.lbl_limite_temperatura)
+
+        self.spin_limite_temperatura = QDoubleSpinBox(self.group_setpoints)
+        self.spin_limite_temperatura.setObjectName(u"spin_limite_temperatura")
+        self.spin_limite_temperatura.setMaximum(125.000000000000000)
+        self.spin_limite_temperatura.setValue(35.000000000000000)
+
+        self.form_setpoints.setWidget(2, QFormLayout.ItemRole.FieldRole, self.spin_limite_temperatura)
+
         self.btn_abrir_configuracoes = QPushButton(self.group_setpoints)
         self.btn_abrir_configuracoes.setObjectName(u"btn_abrir_configuracoes")
 
-        self.form_setpoints.setWidget(2, QFormLayout.ItemRole.SpanningRole, self.btn_abrir_configuracoes)
+        self.form_setpoints.setWidget(3, QFormLayout.ItemRole.SpanningRole, self.btn_abrir_configuracoes)
 
 
         self.layout_linha_topo.addWidget(self.group_setpoints)
@@ -327,6 +339,7 @@ class Ui_MainWindow(object):
         self.group_setpoints.setTitle(QCoreApplication.translate("MainWindow", u"Limites de Alerta", None))
         self.lbl_limite_tds.setText(QCoreApplication.translate("MainWindow", u"Limite TDS (ppm)", None))
         self.lbl_limite_turbidez.setText(QCoreApplication.translate("MainWindow", u"Limite Turbidez (NTU)", None))
+        self.lbl_limite_temperatura.setText(QCoreApplication.translate("MainWindow", u"Limite Temperatura (\u00b0C)", None))
         self.btn_abrir_configuracoes.setText(QCoreApplication.translate("MainWindow", u"Configurar Regras de Alerta...", None))
         self.group_grafico.setTitle(QCoreApplication.translate("MainWindow", u"Tend\u00eancia", None))
         self.group_historico.setTitle(QCoreApplication.translate("MainWindow", u"Hist\u00f3rico de Eventos", None))

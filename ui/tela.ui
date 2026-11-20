@@ -209,14 +209,31 @@
          <item row="1" column="1">
           <widget class="QDoubleSpinBox" name="spin_limite_turbidez">
            <property name="maximum">
-            <double>100.000000000000000</double>
+            <double>1000.000000000000000</double>
            </property>
            <property name="value">
             <double>5.000000000000000</double>
            </property>
           </widget>
          </item>
-         <item row="2" column="0" colspan="2">
+         <item row="2" column="0">
+          <widget class="QLabel" name="lbl_limite_temperatura">
+           <property name="text">
+            <string>Limite Temperatura (°C)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QDoubleSpinBox" name="spin_limite_temperatura">
+           <property name="maximum">
+            <double>125.000000000000000</double>
+           </property>
+           <property name="value">
+            <double>35.000000000000000</double>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="0" colspan="2">
           <widget class="QPushButton" name="btn_abrir_configuracoes">
            <property name="text">
             <string>Configurar Regras de Alerta...</string>

@@ -31,8 +31,8 @@ class ConfigManager:
             "timeout_s": 2,
         },
         "limites_iniciais": {
-            "tds_max_ppm": 300.0,
-            "turbidez_max_ntu": 5.0,
+            "tds_max_ppm": 250.0,       # igual ao LIMITE_TDS_PPM do firmware
+            "turbidez_max_ntu": 185.0,  # igual ao LIMITE_TURBIDEZ do firmware (índice provisório, ainda sem NTU)
         },
     }
 
