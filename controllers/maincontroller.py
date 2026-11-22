@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 from PySide6.QtCore import QDateTime, QPointF, QThread, QTimer, QUrl, Qt
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter
-from PySide6.QtWidgets import QGraphicsView, QMainWindow, QMessageBox, QVBoxLayout
+from PySide6.QtWidgets import QFrame, QGraphicsView, QMainWindow, QMessageBox, QScrollArea, QVBoxLayout
 
 from controllers.historicocontroller import HistoricoController
 from controllers.historicoleiturascontroller import HistoricoLeiturasController
@@ -68,6 +68,7 @@ class MainController(QMainWindow):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self._envolver_em_area_de_rolagem()
 
         # parametros de inicializacao/comunicacao (data/config.json)
         self.config = ConfigManager()
@@ -133,6 +134,22 @@ class MainController(QMainWindow):
 
         # assim que a janela aparece, procura a porta do STM32 sozinho (modo Automático)
         QTimer.singleShot(0, self.iniciar_leitura_serial)
+
+    def _envolver_em_area_de_rolagem(self):
+        """Põe todo o conteúdo da janela dentro de uma área de rolagem.
+
+        A janela tem altura mínima fixa (setMinimumSize no .ui) e, nesse caso, o Qt NÃO impede que ela fique
+        menor do que o layout precisa: numa tela baixa (notebook) ele espreme os widgets abaixo do mínimo
+        deles e os gráficos saem cortados e sobrepostos. Com a área de rolagem, tela baixa ganha uma barra
+        de rolagem e o conteúdo mantém o tamanho legível; tela alta continua sem barra, com o conteúdo
+        esticado até a borda (setWidgetResizable).
+        """
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        # takeCentralWidget ANTES de setCentralWidget: este apagaria o widget central antigo (e os filhos)
+        area.setWidget(self.takeCentralWidget())
+        self.setCentralWidget(area)
 
 
     # ------------------------------------------------------------------

@@ -185,19 +185,19 @@ class Ui_MainWindow(object):
         self.layout_graficos_detalhe.setObjectName(u"layout_graficos_detalhe")
         self.chart_temperatura = QWidget(self.group_grafico)
         self.chart_temperatura.setObjectName(u"chart_temperatura")
-        self.chart_temperatura.setMinimumSize(QSize(0, 220))
+        self.chart_temperatura.setMinimumSize(QSize(0, 160))
 
         self.layout_graficos_detalhe.addWidget(self.chart_temperatura)
 
         self.chart_tds = QWidget(self.group_grafico)
         self.chart_tds.setObjectName(u"chart_tds")
-        self.chart_tds.setMinimumSize(QSize(0, 220))
+        self.chart_tds.setMinimumSize(QSize(0, 160))
 
         self.layout_graficos_detalhe.addWidget(self.chart_tds)
 
         self.chart_turbidez = QWidget(self.group_grafico)
         self.chart_turbidez.setObjectName(u"chart_turbidez")
-        self.chart_turbidez.setMinimumSize(QSize(0, 220))
+        self.chart_turbidez.setMinimumSize(QSize(0, 160))
 
         self.layout_graficos_detalhe.addWidget(self.chart_turbidez)
 
@@ -206,7 +206,7 @@ class Ui_MainWindow(object):
 
         self.chart_geral = QWidget(self.group_grafico)
         self.chart_geral.setObjectName(u"chart_geral")
-        self.chart_geral.setMinimumSize(QSize(0, 240))
+        self.chart_geral.setMinimumSize(QSize(0, 170))
 
         self.layout_graficos.addWidget(self.chart_geral)
 
