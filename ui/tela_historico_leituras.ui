@@ -148,12 +148,6 @@
 
    <item>
     <widget class="QTableWidget" name="table_resumo">
-     <property name="maximumSize">
-      <size>
-       <width>16777215</width>
-       <height>150</height>
-      </size>
-     </property>
      <property name="alternatingRowColors">
       <bool>true</bool>
      </property>

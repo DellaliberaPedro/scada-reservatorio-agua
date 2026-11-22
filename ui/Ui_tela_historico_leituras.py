@@ -110,7 +110,6 @@ class Ui_HistoricoLeiturasDialog(object):
         __qtablewidgetitem3 = QTableWidgetItem()
         self.table_resumo.setHorizontalHeaderItem(3, __qtablewidgetitem3)
         self.table_resumo.setObjectName(u"table_resumo")
-        self.table_resumo.setMaximumSize(QSize(16777215, 150))
         self.table_resumo.setAlternatingRowColors(True)
         self.table_resumo.setColumnCount(4)
         self.table_resumo.setEditTriggers(QAbstractItemView.NoEditTriggers)

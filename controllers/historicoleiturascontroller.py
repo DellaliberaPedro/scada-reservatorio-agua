@@ -68,6 +68,19 @@ def formatar_duracao(segundos):
     return f"{horas} h" + (f" {minutos} min" if minutos else "")
 
 
+def formato_do_eixo_x(duracao):
+    """Formato dos rótulos do eixo X conforme o intervalo desenhado (timedelta).
+
+    Com menos de 1 hora de dados, "HH:mm" repetiria o mesmo rótulo em vários marcadores (6 marcadores em
+    poucos minutos): por isso mostra os segundos. Passando de 24 horas, mostra também o dia.
+    """
+    if duracao < timedelta(hours=1):
+        return "HH:mm:ss"
+    if duracao <= timedelta(hours=24):
+        return "HH:mm"
+    return "dd/MM HH:mm"
+
+
 class HistoricoLeiturasController(QDialog):
     """Janela modal: escolhe um período, consulta o banco (thread do banco) e mostra gráfico + mínimo/média/máximo."""
 
@@ -86,6 +99,8 @@ class HistoricoLeiturasController(QDialog):
 
         header = self.ui.table_resumo.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
+        # A altura da tabela é calculada em showEvent() (depende do estilo); sem rolagem, as 4 linhas cabem.
+        self.ui.table_resumo.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.ui.table_resumo.setRowCount(len(SENSORES))
         self._limpar_resumo()
 
@@ -143,7 +158,22 @@ class HistoricoLeiturasController(QDialog):
         """Ao abrir já consulta o período escolhido (a "Última hora"), sem o operador precisar clicar."""
         super().showEvent(event)
         self._ativa = True
+        self._ajustar_altura_da_tabela()
         self.consultar()
+
+    def _ajustar_altura_da_tabela(self):
+        """Dá à tabela de resumo a altura exata do cabeçalho + as linhas, como o estilo escuro as desenha.
+
+        Um limite fixo (antes: 150 px) cortava a última linha (IQA) e criava uma barra de rolagem, porque no
+        tema escuro cada linha tem mais altura do que no estilo padrão do Qt. Chamado ao exibir a janela,
+        quando o estilo já foi aplicado.
+        """
+        tabela = self.ui.table_resumo
+        tabela.resizeRowsToContents()
+        altura = (tabela.horizontalHeader().sizeHint().height()
+                  + tabela.verticalHeader().length()
+                  + 2 * tabela.frameWidth())
+        tabela.setFixedHeight(altura)
 
     def hideEvent(self, event):
         self._ativa = False
@@ -261,7 +291,7 @@ class HistoricoLeiturasController(QDialog):
         primeiro, ultimo = pontos[0].timestamp, pontos[-1].timestamp
         if primeiro == ultimo:  # um ponto só: abre uma janelinha para o eixo ter intervalo
             primeiro, ultimo = primeiro - timedelta(minutes=1), ultimo + timedelta(minutes=1)
-        self.eixo_x.setFormat("HH:mm" if (ultimo - primeiro) <= timedelta(hours=24) else "dd/MM HH:mm")
+        self.eixo_x.setFormat(formato_do_eixo_x(ultimo - primeiro))
         self.eixo_x.setRange(self._para_qdatetime(primeiro), self._para_qdatetime(ultimo))
 
         maior = max(getattr(p, atributo) for p in pontos for _n, atributo, _e, _c in SENSORES)
