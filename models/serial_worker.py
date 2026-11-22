@@ -132,6 +132,7 @@ class SerialWorker(QObject):
     # ------------------------------------------------------------------
     def executar(self):
         """thread.started -> executar. Fica varrendo/lendo até pedirem para parar."""
+        logger.info("Thread serial iniciada (thread id %s).", threading.get_ident())
         try:
             while not self._parar:
                 conexao = None

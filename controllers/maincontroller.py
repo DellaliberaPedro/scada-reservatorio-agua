@@ -8,6 +8,7 @@ regra de negócio, só o desenho.
 """
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 
 from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
@@ -19,8 +20,8 @@ from controllers.historicocontroller import HistoricoController
 from controllers.settingscontroller import SettingsController
 from models.config_manager import ConfigManager
 from models.data_simulator import SensorSimulator
+from models.database_worker import BancoDeDados
 from models.dispositivo_repository import TAG_RELE_EMERGENCIA, TAG_VALVULA, DispositivoRepository
-from models.evento_repository import EventoRepository
 from models.regra_repository import RegraRepository
 from models.logger import ARQUIVO_LOG
 from models.serial_protocol import CMD_RELE_OFF, CMD_RELE_ON, TipoEventoPlaca
@@ -74,6 +75,13 @@ class MainController(QMainWindow):
         self.estado_valvula = EstadoValvula.ABERTA
         self.id_valvula = None  # id da VALV-01 na tabela dispositivos (FK dos eventos)
 
+        # banco de dados: QThread + DatabaseWorker. Depois que a janela está no ar, a GUI nunca toca no
+        # SQLite: só pede à thread do banco (fila) e recebe o resultado por sinal (models/database_worker.py).
+        # Só a carga inicial (regras e estado da válvula), antes de a janela aparecer, lê direto.
+        self.banco = BancoDeDados(self)
+        self._persistindo = False  # True enquanto um corte/reabertura (simulado) espera a gravação no banco
+        logger.info("GUI thread (thread id %s).", threading.get_ident())
+
         # leitura serial: QThread + Worker (padrão da aula de 26/10). As referências ficam em
         # atributos para o coletor de lixo não destruir os objetos enquanto a thread roda
         self.thread_serial = None
@@ -114,6 +122,7 @@ class MainController(QMainWindow):
         self._aplicar_config_serial()
         self._carregar_estado_dispositivos()
 
+        self.banco.iniciar()  # a carga inicial acabou: daqui para frente, todo SQLite é na thread do banco
         self._log_evento(TipoEvento.STATUS, "Dashboard inicializado (dados simulados).", "-")
 
         self.timer = QTimer(self)
@@ -186,23 +195,23 @@ class MainController(QMainWindow):
             return
 
         valor_anterior = regra.valor_maximo
-        regra.valor_maximo = novo_valor
-        try:
-            if regra.id is None or not RegraRepository.atualizar(regra):
-                raise LookupError("regra não encontrada no banco")
-        except (sqlite3.Error, LookupError) as erro:
-            regra.valor_maximo = valor_anterior
-            spin.setValue(valor_anterior)
-            logger.error("Falha ao salvar o limite de %s no SQLite: %s", sensor, erro)
-            QMessageBox.critical(self, "Falha ao salvar", f"O limite não foi salvo.\n{erro}")
-            return
+        regra.valor_maximo = novo_valor  # a tela já passa a usar o novo limite; a gravação vai para a thread do banco
 
-        self._log_evento(
-            TipoEvento.COMANDO,
-            f"Limite de {sensor} alterado de {valor_anterior:.2f} para {novo_valor:.2f}.",
-            f"{novo_valor:.2f}",
-        )
-        self._enviar_limites_para_placa()
+        def ao_gravar(resultado):  # GUI thread, quando a thread do banco terminar
+            if not resultado.ok:
+                regra.valor_maximo = valor_anterior
+                spin.setValue(valor_anterior)
+                logger.error("Falha ao salvar o limite de %s no SQLite: %s", sensor, resultado.erro)
+                QMessageBox.critical(self, "Falha ao salvar", f"O limite não foi salvo.\n{resultado.erro}")
+                return
+            self._log_evento(
+                TipoEvento.COMANDO,
+                f"Limite de {sensor} alterado de {valor_anterior:.2f} para {novo_valor:.2f}.",
+                f"{novo_valor:.2f}",
+            )
+            self._enviar_limites_para_placa()
+
+        self.banco.executar("atualizar_regra", regra, ao_terminar=ao_gravar)
 
     def _intervalo_atualizacao_ms(self):
         try:
@@ -336,25 +345,29 @@ class MainController(QMainWindow):
         if not dialogo.exec():
             return  # operador cancelou
 
-        try:
-            RegraRepository.substituir_todas(dialogo.regras)  # transacao unica: tudo ou nada
-            self.regras = RegraRepository.listar_todos()
-        except sqlite3.Error as erro:
-            logger.error("Falha ao salvar as regras no SQLite. Rollback executado: %s", erro)
-            QMessageBox.critical(
-                self, "Falha ao salvar", f"As regras NÃO foram salvas (as anteriores foram mantidas).\n{erro}"
+        def ao_gravar(resultado):  # GUI thread, quando a thread do banco terminar
+            if not resultado.ok:
+                logger.error("Falha ao salvar as regras no SQLite. Rollback executado: %s", resultado.erro)
+                QMessageBox.critical(
+                    self,
+                    "Falha ao salvar",
+                    f"As regras NÃO foram salvas (as anteriores foram mantidas).\n{resultado.erro}",
+                )
+                return
+            self.regras = resultado.valor  # o que realmente ficou gravado (substituição numa transação: tudo ou nada)
+            self.regras_violadas.clear()
+            self._sincronizar_spinboxes()
+            self._log_evento(
+                TipoEvento.COMANDO,
+                f"Regras de alerta atualizadas via configuração ({len(self.regras)} regras).",
+                "-",
             )
-            return
+            self._enviar_limites_para_placa()
 
-        self.regras_violadas.clear()
-        self._sincronizar_spinboxes()
-        self._log_evento(
-            TipoEvento.COMANDO, f"Regras de alerta atualizadas via configuração ({len(self.regras)} regras).", "-"
-        )
-        self._enviar_limites_para_placa()
+        self.banco.executar("substituir_regras", dialogo.regras, ao_terminar=ao_gravar)
 
     def abrir_historico(self):
-        dialogo = HistoricoController(parent=self)
+        dialogo = HistoricoController(self.banco, parent=self)
         dialogo.exec()
 
     # ------------------------------------------------------------------
@@ -520,11 +533,17 @@ class MainController(QMainWindow):
             return "-"
         return self._texto_leitura(self.tds_valores[-1], self.turbidez_valores[-1], self.temperaturas[-1])
 
-    def _mudar_estado_valvula(self, estado_destino, tipo_evento, motivo, valor, simular_falha=False):
+    def _mudar_estado_valvula(
+        self, estado_destino, tipo_evento, motivo, valor, simular_falha=False, aplicar_antes=False, ao_concluir=None
+    ):
         """
-        Muda o estado fisico (valvula + rele) e grava o evento numa UNICA transacao.
-        Devolve True se deu certo. Se falhar, o banco faz ROLLBACK e a tela continua
-        mostrando o estado anterior, que e o que realmente esta gravado.
+        Muda o estado fisico (valvula + rele) e grava o evento numa UNICA transacao, NA THREAD DO BANCO.
+        A chamada volta na hora; o resultado chega em ao_concluir(ok), ja na GUI thread.
+
+          - aplicar_antes=False (modo simulado): a tela so muda DEPOIS de o banco confirmar. Se der
+            ROLLBACK, a tela continua mostrando o estado anterior, que e o que realmente esta gravado.
+          - aplicar_antes=True (a placa ja executou): o hardware e a verdade, entao a tela muda JA; se o
+            banco falhar, o operador e avisado (a bomba esta no estado novo, o registro nao foi gravado).
         """
         fechando = estado_destino == EstadoValvula.FECHADA
         if fechando:
@@ -540,42 +559,52 @@ class MainController(QMainWindow):
             valor_medido=valor,
             dispositivo_id=self.id_valvula,
         )
+        operacao = "corte emergencial" if fechando else "reabertura da válvula"
 
-        try:
-            DispositivoRepository.alterar_estados_com_evento(novos_status, evento, simular_falha=simular_falha)
-        except (sqlite3.Error, RuntimeError, LookupError) as erro:
-            operacao = "corte emergencial" if fechando else "reabertura da válvula"
-            logger.error("Falha na operação de %s. Rollback executado: %s", operacao, erro)
-            self._registrar_estado_pos_rollback()
-            QMessageBox.critical(
-                self,
-                "Falha na operação",
-                f"A operação de {operacao} falhou e foi desfeita (ROLLBACK).\n"
-                f"Nenhuma alteração foi gravada no banco.\n\nMotivo: {erro}",
-            )
-            return False
+        def mostrar_na_tela():
+            self._aplicar_estado_valvula(estado_destino)
+            self.ui.lbl_ultimo_evento.setStyleSheet("")
+            self.ui.lbl_ultimo_evento.setText(motivo)
 
-        self._aplicar_estado_valvula(estado_destino)
-        self.ui.lbl_ultimo_evento.setStyleSheet("")
-        self.ui.lbl_ultimo_evento.setText(motivo)
-        if fechando:
-            logger.warning(
-                "Corte de carga executado: %s FECHADO / %s ABERTO. Motivo: %s (valor medido: %s)",
-                TAG_VALVULA, TAG_RELE_EMERGENCIA, motivo, valor,
-            )
+        def ao_gravar(resultado):  # GUI thread, quando a thread do banco terminar
+            if not aplicar_antes:
+                self._persistindo = False
+            if resultado.ok:
+                if not aplicar_antes:
+                    mostrar_na_tela()
+                if fechando:
+                    logger.warning(
+                        "Corte de carga executado: %s FECHADO / %s ABERTO. Motivo: %s (valor medido: %s)",
+                        TAG_VALVULA, TAG_RELE_EMERGENCIA, motivo, valor,
+                    )
+                else:
+                    logger.info("Válvula reaberta: %s ABERTO / %s FECHADO. (valor medido: %s)",
+                                TAG_VALVULA, TAG_RELE_EMERGENCIA, valor)
+            else:
+                logger.error("Falha na operação de %s. Rollback executado: %s", operacao, resultado.erro)
+                if resultado.detalhe:  # lido pela thread do banco logo depois do rollback (prova de que desfez)
+                    logger.info("Estado no banco após o rollback: %s.", resultado.detalhe)
+                QMessageBox.critical(
+                    self,
+                    "Falha na operação",
+                    f"A operação de {operacao} falhou e foi desfeita (ROLLBACK).\n"
+                    f"Nenhuma alteração foi gravada no banco.\n\nMotivo: {resultado.erro}",
+                )
+                if aplicar_antes:
+                    self.statusBar().showMessage(
+                        "ATENÇÃO: a placa executou o comando, mas o registro no banco falhou (rollback).", 10000
+                    )
+                else:
+                    self._atualizar_botoes_valvula()
+            if ao_concluir is not None:
+                ao_concluir(resultado.ok)
+
+        if aplicar_antes:
+            mostrar_na_tela()
         else:
-            logger.info("Válvula reaberta: %s ABERTO / %s FECHADO. (valor medido: %s)",
-                        TAG_VALVULA, TAG_RELE_EMERGENCIA, valor)
-        return True
-
-    def _registrar_estado_pos_rollback(self):
-        """Le o banco depois da falha e escreve no log o estado que ficou gravado (prova do rollback)."""
-        # a tela nao foi alterada antes da falha, entao ela ja mostra o estado correto
-        try:
-            estados = ", ".join(f"{d.tag}={d.status.value}" for d in DispositivoRepository.listar_todos())
-            logger.info("Estado no banco após o rollback: %s.", estados)
-        except sqlite3.Error as erro:
-            logger.error("Não foi possível ler o estado após o rollback: %s", erro)
+            self._persistindo = True  # nenhum outro corte/reabertura enquanto o banco não responder
+            self._atualizar_botoes_valvula()
+        self.banco.executar("alterar_estados", novos_status, evento, simular_falha, ao_terminar=ao_gravar)
 
     def _checar_protecao_espontanea(self, leitura):
         if self.estado_valvula == EstadoValvula.ABERTA and self.simulador.deveria_disparar_protecao(
@@ -635,7 +664,8 @@ class MainController(QMainWindow):
 
     def _atualizar_botoes_valvula(self):
         aberta = self.estado_valvula == EstadoValvula.ABERTA
-        livre = self._pendente is None  # esperando a placa responder, nenhum dos dois botões vale
+        # esperando a placa responder (ou o banco gravar), nenhum dos dois botões vale
+        livre = self._pendente is None and not self._persistindo
         self.ui.btn_emergencia.setEnabled(aberta and livre)
         self.ui.btn_abrir_valvula.setEnabled(not aberta and livre)
 
@@ -649,8 +679,12 @@ class MainController(QMainWindow):
             (ou o timeout avisa que a placa não respondeu).
           - Nunca conectou (modo simulado): muda direto, como era antes de existir a placa.
           - Já usou a placa, mas ela está desconectada: avisa; não finge que cortou.
-        Devolve True se a ação foi feita (simulado) ou enviada à placa (aguardando a confirmação).
+        Devolve True se a ação foi aceita: pedida ao banco (simulado) ou enviada à placa (aguardando a confirmação).
         """
+        if self._persistindo:
+            self.statusBar().showMessage("Aguardando o banco gravar a operação anterior...", 3000)
+            return False
+
         if not self.placa_conectada:
             if self.modo_real:
                 QMessageBox.warning(
@@ -660,10 +694,15 @@ class MainController(QMainWindow):
                     "O estado mostrado não foi alterado. Em emergência, use o botão físico.",
                 )
                 return False
-            ok = self._mudar_estado_valvula(estado_destino, tipo_evento, motivo, valor, simular_falha)
-            if ok and avisar:
-                QMessageBox.warning(self, "Proteção Ativada", motivo)
-            return ok
+
+            def avisar_se_gravou(ok):  # GUI thread, depois de o banco responder
+                if ok and avisar:
+                    QMessageBox.warning(self, "Proteção Ativada", motivo)
+
+            self._mudar_estado_valvula(
+                estado_destino, tipo_evento, motivo, valor, simular_falha, ao_concluir=avisar_se_gravou
+            )
+            return True
 
         if self._pendente is not None:
             self.statusBar().showMessage("Aguardando a confirmação do comando anterior...", 4000)
@@ -712,18 +751,13 @@ class MainController(QMainWindow):
             logger.info("Placa confirmou %s sem comando pendente: ignorado.", comando)
             return
         self._cancelar_pendencia()
-        ok = self._mudar_estado_valvula(
-            pendente["estado"], pendente["tipo"], pendente["motivo"], pendente["valor"], pendente["simular_falha"]
+        # a placa JÁ executou o comando: a tela segue o hardware agora; o banco grava na thread dele
+        self._mudar_estado_valvula(
+            pendente["estado"], pendente["tipo"], pendente["motivo"], pendente["valor"], pendente["simular_falha"],
+            aplicar_antes=True,
         )
-        if ok:
-            if pendente["avisar"]:
-                QMessageBox.warning(self, "Proteção Ativada", pendente["motivo"])
-            return
-        # a placa JÁ executou o comando: a tela segue o hardware, mesmo que o banco tenha dado rollback
-        self._aplicar_estado_valvula(pendente["estado"])
-        self.statusBar().showMessage(
-            "ATENÇÃO: a placa executou o comando, mas o registro no banco falhou (rollback).", 10000
-        )
+        if pendente["avisar"]:
+            QMessageBox.warning(self, "Proteção Ativada", pendente["motivo"])
 
     def _ao_evento_placa(self, evento):
         """Linha "E,...": a placa fez algo por conta própria (corte por limite ou botão) ou recusou um comando."""
@@ -743,11 +777,10 @@ class MainController(QMainWindow):
             self._log_evento(TipoEvento.ALERTA, f"{motivo} (a bomba já constava como desligada)", valor)
             return
 
-        # mudança espontânea no hardware: caixa de aviso + registro automático (exigência do enunciado)
-        if self._mudar_estado_valvula(EstadoValvula.FECHADA, TipoEvento.ALERTA, motivo, valor):
-            QMessageBox.warning(self, "Proteção Ativada", motivo)
-        else:
-            self._aplicar_estado_valvula(EstadoValvula.FECHADA)  # a placa já cortou, a tela segue o hardware
+        # mudança espontânea no hardware: caixa de aviso + registro automático (exigência do enunciado).
+        # A placa já cortou: a tela segue o hardware na hora e o registro vai para a thread do banco.
+        self._mudar_estado_valvula(EstadoValvula.FECHADA, TipoEvento.ALERTA, motivo, valor, aplicar_antes=True)
+        QMessageBox.warning(self, "Proteção Ativada", motivo)
 
     def _ao_reabertura_recusada(self):
         """"E,BLOQUEADO": a placa não religou a bomba (leitura acima do limite ou botão apertado)."""
@@ -1077,22 +1110,24 @@ class MainController(QMainWindow):
                 self.thread_serial.wait(5000)
             except RuntimeError:
                 pass  # a thread já foi destruída pelo deleteLater
+        self.banco.encerrar()  # grava o que ainda está na fila do banco e espera a thread terminar
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Historico
     # ------------------------------------------------------------------
     def _log_evento(self, tipo, descricao, valor, nivel_log=None):
-        """Registra o evento no SQLite (tabela eventos) e no logs/smartgrid.log."""
+        """Registra o evento no logs/smartgrid.log e pede à thread do banco para gravá-lo no SQLite (tabela eventos)."""
         registro = RegistroEvento(timestamp=datetime.now(), tipo=tipo, descricao=descricao, valor_medido=valor)
 
         nivel = nivel_log if nivel_log is not None else NIVEL_LOG_POR_TIPO[tipo]
         logger.log(nivel, "%s: %s (valor medido: %s)", tipo.value, descricao, valor)
 
-        try:
-            EventoRepository.inserir(registro)
-        except sqlite3.Error as erro:
-            # o evento continua no smartgrid.log mesmo se o banco falhar
-            logger.error("Falha ao gravar evento no SQLite (%s): %s", descricao, erro)
-            self.statusBar().showMessage(f"ERRO: evento não gravado no banco — {erro}", 10000)
+        def ao_gravar(resultado):  # GUI thread, quando a thread do banco terminar
+            if not resultado.ok:
+                # o evento continua no smartgrid.log mesmo se o banco falhar
+                logger.error("Falha ao gravar evento no SQLite (%s): %s", descricao, resultado.erro)
+                self.statusBar().showMessage(f"ERRO: evento não gravado no banco — {resultado.erro}", 10000)
+
+        self.banco.executar("inserir_evento", registro, ao_terminar=ao_gravar)
         return registro
