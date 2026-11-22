@@ -37,6 +37,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from models.dispositivo_repository import DispositivoRepository
 from models.evento_repository import EventoRepository
+from models.leitura_repository import LeituraRepository
 from models.regra_repository import RegraRepository
 
 logger = logging.getLogger(__name__)
@@ -102,12 +103,23 @@ def _listar_eventos():
     return EventoRepository.listar_todos()
 
 
+def _inserir_leitura(leitura):
+    return LeituraRepository.inserir(leitura)
+
+
+def _consultar_leituras(inicio, fim, max_pontos):
+    """Histórico de leituras de um período, já agrupado em no máximo max_pontos pontos (ver LeituraRepository)."""
+    return LeituraRepository.consultar_periodo(inicio, fim, max_pontos)
+
+
 OPERACOES = {
     "inserir_evento": _inserir_evento,
     "alterar_estados": _alterar_estados,
     "atualizar_regra": _atualizar_regra,
     "substituir_regras": _substituir_regras,
     "listar_eventos": _listar_eventos,
+    "inserir_leitura": _inserir_leitura,
+    "consultar_leituras": _consultar_leituras,
 }
 
 

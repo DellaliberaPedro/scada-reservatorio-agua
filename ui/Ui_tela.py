@@ -231,6 +231,11 @@ class Ui_MainWindow(object):
 
         self.layout_historico.addWidget(self.btn_abrir_historico)
 
+        self.btn_abrir_historico_leituras = QPushButton(self.group_historico)
+        self.btn_abrir_historico_leituras.setObjectName(u"btn_abrir_historico_leituras")
+
+        self.layout_historico.addWidget(self.btn_abrir_historico_leituras)
+
 
         self.layout_principal.addWidget(self.group_historico)
 
@@ -344,9 +349,10 @@ class Ui_MainWindow(object):
         self.lbl_limite_temperatura.setText(QCoreApplication.translate("MainWindow", u"Limite Temperatura (\u00b0C)", None))
         self.btn_abrir_configuracoes.setText(QCoreApplication.translate("MainWindow", u"Configurar Regras de Alerta...", None))
         self.group_grafico.setTitle(QCoreApplication.translate("MainWindow", u"Tend\u00eancia", None))
-        self.group_historico.setTitle(QCoreApplication.translate("MainWindow", u"Hist\u00f3rico de Eventos", None))
-        self.lbl_resumo_historico.setText(QCoreApplication.translate("MainWindow", u"Comandos, alertas e mudan\u00e7as de estado registrados durante a sess\u00e3o.", None))
+        self.group_historico.setTitle(QCoreApplication.translate("MainWindow", u"Hist\u00f3ricos", None))
+        self.lbl_resumo_historico.setText(QCoreApplication.translate("MainWindow", u"Eventos do sistema e leituras dos sensores gravados no banco.", None))
         self.btn_abrir_historico.setText(QCoreApplication.translate("MainWindow", u"Abrir Hist\u00f3rico de Eventos...", None))
+        self.btn_abrir_historico_leituras.setText(QCoreApplication.translate("MainWindow", u"Abrir Hist\u00f3rico de Leituras...", None))
         self.group_serial.setTitle(QCoreApplication.translate("MainWindow", u"Comunica\u00e7\u00e3o Serial", None))
         self.lbl_porta_com.setText(QCoreApplication.translate("MainWindow", u"Porta COM:", None))
         self.combo_porta_com.setItemText(0, QCoreApplication.translate("MainWindow", u"COM1", None))

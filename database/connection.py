@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS eventos (
 
 CREATE INDEX IF NOT EXISTS idx_eventos_data_hora ON eventos (data_hora);
 
+-- Série temporal dos sensores: uma linha por leitura REAL vinda do STM32 (a cada ~2 s).
+-- O índice em data_hora é o que deixa a consulta por período rápida mesmo com centenas de milhares de linhas.
+CREATE TABLE IF NOT EXISTS leituras (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    data_hora     DATETIME NOT NULL,
+    temperatura_c REAL     NOT NULL,
+    tds_ppm       REAL     NOT NULL CHECK (tds_ppm >= 0),
+    turbidez_ntu  REAL     NOT NULL CHECK (turbidez_ntu >= 0),
+    iqa           REAL     NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_leituras_data_hora ON leituras (data_hora);
+
 CREATE TABLE IF NOT EXISTS regras_alerta (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     nome         TEXT    NOT NULL CHECK (length(trim(nome)) > 0),
@@ -50,7 +63,7 @@ CREATE TABLE IF NOT EXISTS regras_alerta (
 );
 """
 
-TABELAS_OBRIGATORIAS = {"dispositivos", "eventos", "regras_alerta"}
+TABELAS_OBRIGATORIAS = {"dispositivos", "eventos", "regras_alerta", "leituras"}
 
 # dispositivos físicos do reservatório (inseridos só se ainda não existirem)
 #   VALV-01  -> válvula solenoide de entrada: ABERTO = água entrando (normal)

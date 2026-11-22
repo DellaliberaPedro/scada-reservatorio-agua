@@ -304,13 +304,13 @@
     <item>
      <widget class="QGroupBox" name="group_historico">
       <property name="title">
-       <string>Histórico de Eventos</string>
+       <string>Históricos</string>
       </property>
       <layout class="QHBoxLayout" name="layout_historico">
        <item>
         <widget class="QLabel" name="lbl_resumo_historico">
          <property name="text">
-          <string>Comandos, alertas e mudanças de estado registrados durante a sessão.</string>
+          <string>Eventos do sistema e leituras dos sensores gravados no banco.</string>
          </property>
         </widget>
        </item>
@@ -331,6 +331,13 @@
         <widget class="QPushButton" name="btn_abrir_historico">
          <property name="text">
           <string>Abrir Histórico de Eventos...</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btn_abrir_historico_leituras">
+         <property name="text">
+          <string>Abrir Histórico de Leituras...</string>
          </property>
         </widget>
        </item>

@@ -54,6 +54,41 @@ class LeituraTelemetria:
     iqa: float  # indice de qualidade da agua, calculado a partir do TDS e turbidez
 
 
+MAX_PONTOS_GRAFICO = 1200  # pontos por curva no gráfico do histórico (4 curvas x 1200 desenham de forma instantânea)
+
+
+@dataclass(frozen=True)
+class PontoHistorico:
+    """Um ponto do gráfico histórico: a MÉDIA das leituras de um intervalo de tempo (ver LeituraRepository)."""
+    timestamp: datetime  # horário da primeira leitura do intervalo
+    temperatura_c: float
+    tds_ppm: float
+    turbidez_ntu: float
+    iqa: float
+    amostras: int        # quantas leituras entraram na média
+
+
+@dataclass(frozen=True)
+class EstatisticaSensor:
+    minimo: float
+    media: float
+    maximo: float
+
+
+@dataclass(frozen=True)
+class ConsultaLeituras:
+    """Resposta de uma consulta ao histórico: pontos já agrupados + estatística de TODAS as leituras do período."""
+    inicio: datetime
+    fim: datetime
+    total_leituras: int        # leituras reais encontradas no período
+    segundos_por_ponto: int    # tamanho do intervalo que cada ponto resume (1 = leitura a leitura)
+    pontos: tuple[PontoHistorico, ...] = ()
+    temperatura: EstatisticaSensor | None = None
+    tds: EstatisticaSensor | None = None
+    turbidez: EstatisticaSensor | None = None
+    iqa: EstatisticaSensor | None = None
+
+
 @dataclass
 class RegraAlerta:
     """Regra de limite configuravel pelo operador (setpoint)."""

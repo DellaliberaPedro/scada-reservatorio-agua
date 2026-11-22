@@ -49,7 +49,8 @@ ControleReservatoriodeAgua/
 ├── controllers/                 # lógica das janelas, sinais/slots e orquestração
 │   ├── maincontroller.py        # janela principal (dashboard)
 │   ├── settingscontroller.py    # modal de regras de alerta (com validação)
-│   └── historicocontroller.py   # janela de histórico de eventos
+│   ├── historicocontroller.py   # janela de histórico de eventos
+│   └── historicoleiturascontroller.py  # janela de histórico de leituras (gráfico + resumo por período)
 ├── database/                    # conexão SQLite (timeout, PRAGMA foreign_keys, init_db)
 ├── models/                      # entidades, repositórios (SQL com '?'), config e log
 │   ├── sensor_data.py           # estruturas de dados (leitura, evento, regra, dispositivo)
@@ -66,6 +67,7 @@ Regra de organização: nada de lógica de negócio dentro de `ui/` — os arqui
 ```bash
 pyside6-uic ui/tela.ui -o ui/Ui_tela.py
 pyside6-uic ui/tela_configuracoes.ui -o ui/Ui_tela_configuracoes.py
+pyside6-uic ui/tela_historico_leituras.ui -o ui/Ui_tela_historico_leituras.py
 ```
 
 ## Persistência, logs e demonstração de falhas (A1/2)
@@ -74,7 +76,7 @@ Na primeira execução são criados automaticamente:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `data/smartgrid.db` | SQLite: `dispositivos` (VALV-01, RELE-EMG), `eventos` (histórico) e `regras_alerta` |
+| `data/smartgrid.db` | SQLite: `dispositivos` (VALV-01, RELE-EMG), `eventos` (histórico), `regras_alerta` e `leituras` (série temporal dos sensores) |
 | `data/config.json` | porta COM, baud rate, timeout, limites iniciais e intervalo de atualização |
 | `logs/smartgrid.log` | auditoria com data/hora e severidade `[INFO]`, `[WARNING]`, `[ERROR]` |
 
@@ -135,9 +137,30 @@ PC                                    STM32 (firmware v5)
 
 O firmware fica em `firmware/firmware_reservatorio/` (Arduino IDE + core STM32duino, gravado por ST-Link).
 
+## Persistência híbrida e histórico de leituras (Critério 3)
+
+Cada tipo de dado vai para o armazenamento que combina com ele:
+
+| Dado | Onde fica | Por quê |
+|---|---|---|
+| Leituras dos sensores (série temporal) | SQLite, tabela `leituras` | volume alto, consulta por período |
+| Eventos, regras de alerta, estado dos dispositivos | SQLite (`eventos`, `regras_alerta`, `dispositivos`) | dados relacionais, com chave estrangeira e transação |
+| Porta COM, baud desejado, timeout, limites iniciais | `data/config.json` | poucos parâmetros que o operador pode editar à mão |
+| Auditoria (quem fez o quê e quando) | `logs/smartgrid.log` | texto sequencial, sobrevive mesmo se o banco falhar |
+
+**Gráfico em tempo real.** O gráfico da tela principal é alimentado direto pela leitura que acabou de chegar (listas em memória), sem depender do banco. Se o banco travar, o gráfico continua andando.
+
+**Gravação das leituras.** Toda leitura vinda da **placa** vira uma linha em `leituras` (data/hora, temperatura, TDS, turbidez e IQA). O pedido vai para a fila da thread do banco e a tela **não espera**. Leituras do simulador **não** são gravadas (não sujam a série). Se o banco não conseguir gravar, o operador é avisado **uma vez** (barra de status e evento de alerta); o resto vai para o `smartgrid.log`, e o aviso volta a valer se o banco se recuperar e falhar de novo.
+
+**Histórico assíncrono.** *Históricos → Abrir Histórico de Leituras...* abre a janela com os períodos *Última hora*, *6 horas*, *24 horas*, *7 dias* ou *Personalizado* (campos De/Até). Ao clicar em *Consultar* a janela pede à **thread do banco** e continua respondendo; o botão fica desabilitado até a resposta voltar, período inválido (início depois do fim) nem chega ao banco e uma resposta que chegue depois de a janela fechar é descartada.
+
+**Muitos dados sem travar o gráfico.** Uma semana de leituras a cada 2 s tem cerca de 300 mil linhas, pesado demais para desenhar. A consulta **agrupa no próprio SQLite**: o período é dividido, a partir do início, em intervalos iguais e cada intervalo vira um ponto com a média das leituras dele, no máximo `MAX_PONTOS_GRAFICO` (1200). O índice `idx_leituras_data_hora` evita varrer a tabela inteira. O **mínimo, a média e o máximo** da tabela de resumo usam *todas* as leituras (a média é ponderada pelo número de leituras de cada intervalo), então não dependem do agrupamento.
+
+> **Medido (ambiente de desenvolvimento, SQLite local):** 300 mil leituras (uma semana) ocupam cerca de 24 MB e a consulta de 7 dias volta em menos de 0,5 s; uma hora de leituras volta em ~10 ms. Em outro computador os tempos mudam. Ainda **não há política de limpeza** da tabela: ela só cresce (cerca de 43 mil linhas por dia de operação contínua).
+
 ## Testes automatizados
 
-Os testes da camada pura (protocolo e máquina de estados do handshake, sem Qt e sem porta serial) ficam em `tests/`:
+Os testes da camada pura (protocolo e máquina de estados do handshake, e a série temporal de leituras em SQLite temporário; sem Qt e sem porta serial) ficam em `tests/`:
 
 ```bash
 pip install pytest

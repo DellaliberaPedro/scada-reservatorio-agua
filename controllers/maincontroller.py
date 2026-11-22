@@ -17,6 +17,7 @@ from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import QGraphicsView, QMainWindow, QMessageBox, QVBoxLayout
 
 from controllers.historicocontroller import HistoricoController
+from controllers.historicoleiturascontroller import HistoricoLeiturasController
 from controllers.settingscontroller import SettingsController
 from models.config_manager import ConfigManager
 from models.data_simulator import SensorSimulator
@@ -80,6 +81,7 @@ class MainController(QMainWindow):
         # Só a carga inicial (regras e estado da válvula), antes de a janela aparecer, lê direto.
         self.banco = BancoDeDados(self)
         self._persistindo = False  # True enquanto um corte/reabertura (simulado) espera a gravação no banco
+        self._falha_leituras_avisada = False  # evita avisar a cada leitura quando o banco não consegue gravar a série
         logger.info("GUI thread (thread id %s).", threading.get_ident())
 
         # leitura serial: QThread + Worker (padrão da aula de 26/10). As referências ficam em
@@ -330,6 +332,7 @@ class MainController(QMainWindow):
         self.ui.btn_desconectar.clicked.connect(self.desconectar_serial)
         self.ui.btn_abrir_configuracoes.clicked.connect(self.abrir_configuracoes)
         self.ui.btn_abrir_historico.clicked.connect(self.abrir_historico)
+        self.ui.btn_abrir_historico_leituras.clicked.connect(self.abrir_historico_leituras)
         self.ui.spin_limite_tds.editingFinished.connect(
             lambda: self._alterar_limite_rapido("TDS (ppm)", self.ui.spin_limite_tds)
         )
@@ -370,6 +373,10 @@ class MainController(QMainWindow):
         dialogo = HistoricoController(self.banco, parent=self)
         dialogo.exec()
 
+    def abrir_historico_leituras(self):
+        dialogo = HistoricoLeiturasController(self.banco, parent=self)
+        dialogo.exec()
+
     # ------------------------------------------------------------------
     # Loop de telemetria
     # ------------------------------------------------------------------
@@ -389,6 +396,23 @@ class MainController(QMainWindow):
         self._atualizar_lcds(leitura)
         self._redesenhar_graficos()
         self._checar_setpoints(leitura)
+        if self.modo_real:  # só leitura da placa vira histórico: o simulador não suja a série temporal
+            self._gravar_leitura(leitura)
+
+    def _gravar_leitura(self, leitura):
+        """Pede à thread do banco para gravar a leitura (tabela leituras). A GUI não espera: o gráfico já foi desenhado."""
+        def ao_gravar(resultado):  # GUI thread, quando a thread do banco terminar
+            if resultado.ok:
+                self._falha_leituras_avisada = False  # voltou a gravar: se falhar de novo, avisa de novo
+                return
+            logger.error("Falha ao gravar leitura no SQLite: %s", resultado.erro)
+            if self._falha_leituras_avisada:
+                return  # uma leitura a cada ~2 s: avisa uma vez só, o resto fica no smartgrid.log
+            self._falha_leituras_avisada = True
+            self.statusBar().showMessage(f"ERRO: leituras não estão sendo gravadas no banco — {resultado.erro}", 10000)
+            self._log_evento(TipoEvento.ALERTA, "Leituras não estão sendo gravadas no banco (histórico incompleto).", "-")
+
+        self.banco.executar("inserir_leitura", leitura, ao_terminar=ao_gravar)
 
     def _atualizar_lcds(self, leitura):
         self.ui.lcd_temperatura.display(leitura.temperatura_c)
