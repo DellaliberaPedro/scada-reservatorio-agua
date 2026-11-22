@@ -986,14 +986,10 @@ class MainController(QMainWindow):
 
         escolha = self.ui.combo_porta_com.currentText()
         porta_fixa = None if escolha == OPCAO_AUTOMATICO else escolha
-        try:
-            baud = int(self.ui.combo_baud_rate.currentText())
-        except ValueError:
-            baud = BAUD_PADRAO
 
         self.thread_serial = QThread()
         self.worker_serial = SerialWorker(
-            baud_rate=baud,
+            baud_rate=self._baud_desejado(),
             porta_fixa=porta_fixa,
             timeout_sem_dados_s=self.ui.spin_timeout.value(),
         )
@@ -1023,6 +1019,13 @@ class MainController(QMainWindow):
         self._definir_status_conexao("Status: Procurando dispositivo...", COR_PROCURANDO)
         self.thread_serial.start()
 
+    def _baud_desejado(self):
+        """O baud escolhido na tela. A conversa sempre começa a 9600 e o handshake negocia até este valor."""
+        try:
+            return int(self.ui.combo_baud_rate.currentText())
+        except ValueError:
+            return BAUD_PADRAO
+
     def parar_leitura_serial(self):
         """Interrupção cooperativa: o worker só levanta a bandeira; nada de terminate()."""
         if self.worker_serial is not None:
@@ -1050,13 +1053,15 @@ class MainController(QMainWindow):
         self._definir_status_conexao(f"Status: {texto}", COR_PROCURANDO)
 
     def _ao_conectar_serial(self, porta, baud):
+        """Chega DEPOIS do handshake: 'baud' é o que foi negociado com a placa (pode ser menor que o desejado)."""
         self._entrar_no_modo_real()
         self.placa_conectada = True
         self._definir_status_conexao(f"Status: Conectado ({porta} @ {baud} bps)", COR_CONECTADO)
-        # a porta que realmente funcionou fica salva no config.json
-        if not self.config.atualizar_serial(porta, baud, self.ui.spin_timeout.value()):
+        # a porta que funcionou fica salva no config.json, junto com o baud DESEJADO (não o negociado:
+        # se a placa recusar uma vez, a próxima conexão tenta de novo o baud que o operador escolheu)
+        if not self.config.atualizar_serial(porta, self._baud_desejado(), self.ui.spin_timeout.value()):
             self.statusBar().showMessage("Não foi possível salvar os parâmetros em config.json.", 6000)
-        self._log_evento(TipoEvento.STATUS, f"Conexão serial estabelecida — {porta}.", f"{baud} bps")
+        self._log_evento(TipoEvento.STATUS, f"Conexão serial estabelecida — {porta} (handshake OK, baud negociado).", f"{baud} bps")
         self._sincronizar_bomba_ao_conectar()
         self._enviar_limites_para_placa()
 

@@ -9,10 +9,13 @@ Segue o padrão das aulas:
 
 Ciclo de vida do executar():
 
-    varre as portas -> abre -> espera estabilizar (2 s) -> limpa o buffer
-        -> confirma que é o STM32 (precisa chegar uma linha "L,...")
+    varre as portas -> abre A 9600 bps -> espera estabilizar (2 s) -> limpa o buffer
+        -> HANDSHAKE (models/handshake.py): HELLO -> H,READY -> BAUD,<n> -> H,BAUD -> START -> H,START
+           (a placa liga calada; só depois do START ela manda as leituras. Os dois lados trocam para o baud negociado)
         -> lê em laço
         -> cabo saiu (SerialException) ou parou de chegar dado? fecha, avisa e volta a varrer
+
+A porta só é publicada para enviar_comando() DEPOIS do handshake: antes dele a placa recusaria os comandos.
 """
 import logging
 import threading
@@ -23,7 +26,10 @@ import serial.tools.list_ports
 from PySide6.QtCore import QObject, Signal
 from serial import SerialException
 
+from models.handshake import Handshake, Passo
 from models.serial_protocol import (
+    BAUD_INICIAL,
+    CMD_BAUD,
     COMANDOS_VALIDOS,
     LinhaInvalida,
     SensorSemLeitura,
@@ -39,13 +45,13 @@ from models.serial_protocol import (
 
 logger = logging.getLogger(__name__)
 
-BAUD_PADRAO = 115200
+BAUD_PADRAO = 115200  # baud DESEJADO por padrão; toda conversa começa a BAUD_INICIAL (9600) e negocia até aqui
 VID_STM32 = 0x0483  # fabricante (STMicroelectronics) do "Virtual COM Port" USB da Blue Pill
 
 TIMEOUT_LEITURA_S = 1.0        # readline() espera no máximo 1 s (igual aos exemplos da aula)
 TIMEOUT_ESCRITA_S = 1.0        # write() nunca pode travar a tela se a porta engasgar
 ESTABILIZACAO_S = 2.0         # pausa depois de abrir a porta (aula: DTR/bootloader; no STM32: o USB reenumera)
-CONFIRMACAO_S = 6.0            # tempo para chegar uma linha "L," e provar que a porta é a do STM32
+TIMEOUT_PASSO_HANDSHAKE_S = 1.5  # espera por UMA resposta do handshake antes de reenviar o comando
 INTERVALO_VARREDURA_S = 2.0    # pausa entre varreduras enquanto não há dispositivo
 PASSO_ESPERA_S = 0.1           # as esperas são fatiadas: o botão Desconectar responde rápido
 TIMEOUT_SEM_DADOS_MIN_S = 5.0  # o STM32 manda 1 linha a cada 2 s; menos que isso daria falso alarme
@@ -69,7 +75,9 @@ class SerialWorker(QObject):
 
     def __init__(self, baud_rate=BAUD_PADRAO, porta_fixa=None, timeout_sem_dados_s=TIMEOUT_SEM_DADOS_MIN_S):
         super().__init__()
-        self._baud = int(baud_rate)
+        self._baud = int(baud_rate)    # o baud DESEJADO: a negociação com a placa decide o que vale de fato
+        self._baud_ativo = None        # o baud em que a conversa ficou depois do handshake
+        self._ultimo_aviso_handshake = None  # evita repetir o mesmo alerta a cada varredura
         self._porta_fixa = porta_fixa  # None = automático (varre as portas e acha o STM32)
         self._timeout_sem_dados_s = max(float(timeout_sem_dados_s), TIMEOUT_SEM_DADOS_MIN_S)
         self._parar = False
@@ -143,7 +151,7 @@ class SerialWorker(QObject):
                         continue
 
                     self._definir_conexao_ativa(conexao)  # a partir daqui a GUI já pode mandar comandos
-                    self.conectado.emit(conexao.port, self._baud)
+                    self.conectado.emit(conexao.port, self._baud_ativo)
                     motivo = self._ler_ate_perder(conexao)
                     self._definir_conexao_ativa(None)  # antes de fechar: ninguém escreve numa porta fechada
                     self._fechar(conexao)
@@ -203,8 +211,9 @@ class SerialWorker(QObject):
         dispositivo = info.device
         self.status_msg.emit(f"Testando {dispositivo} ({info.description})...")
         try:
+            # toda conversa começa a 9600 bps: é o baud em que a placa liga e espera o HELLO
             conexao = serial.Serial(
-                port=dispositivo, baudrate=self._baud, timeout=TIMEOUT_LEITURA_S, write_timeout=TIMEOUT_ESCRITA_S
+                port=dispositivo, baudrate=BAUD_INICIAL, timeout=TIMEOUT_LEITURA_S, write_timeout=TIMEOUT_ESCRITA_S
             )
         except SerialException as erro:
             logger.warning("Não foi possível abrir %s: %s", dispositivo, erro)
@@ -218,7 +227,8 @@ class SerialWorker(QObject):
                 return None
             conexao.reset_input_buffer()  # joga fora o lixo acumulado no boot
             conexao.reset_output_buffer()
-            confirmada = self._confirmar_dispositivo(conexao)
+            self.status_msg.emit(f"Handshake com {dispositivo} a {BAUD_INICIAL} bps...")
+            confirmada = self._negociar(conexao, dispositivo)
         except (SerialException, OSError) as erro:
             logger.warning("Falha ao testar %s: %s", dispositivo, erro)
             self._fechar(conexao)
@@ -229,20 +239,73 @@ class SerialWorker(QObject):
 
         self._fechar(conexao)
         if confirmada is False and not self._porta_fixa and info.vid != VID_STM32:
-            logger.info("%s abriu, mas não fala o protocolo do STM32: ignorada até ser reconectada.", dispositivo)
+            logger.info("%s abriu, mas não completou o handshake do STM32: ignorada até ser reconectada.", dispositivo)
             self._descartadas.add(dispositivo)
         return None
 
-    def _confirmar_dispositivo(self, conexao):
-        """True = é o STM32; False = ninguém falou o nosso protocolo a tempo; None = mandaram parar."""
-        limite = time.monotonic() + CONFIRMACAO_S
-        while time.monotonic() < limite:
-            if self._parar:
-                return None
-            reconhecida, _ = self._interpretar(self._ler_linha(conexao))
-            if reconhecida:
+    def _negociar(self, conexao, dispositivo):
+        """
+        Handshake com a placa (a decisão de cada passo é da máquina de estados de models/handshake.py).
+        True = placa pronta e baud negociado; False = a placa não respondeu; None = mandaram parar.
+        """
+        handshake = Handshake(self._baud)
+        passo = handshake.iniciar()
+        viu_leitura = False  # chegaram linhas "L," sem handshake: firmware antigo (v4) ou placa já transmitindo
+        while True:
+            self._aplicar_passo(conexao, dispositivo, passo)
+            if passo.falha:
+                self._avisar_falha_do_handshake(dispositivo, passo.falha, viu_leitura)
+                return False
+            if passo.concluido:
+                self._baud_ativo = handshake.baud_negociado
+                self._ultimo_aviso_handshake = None
+                self._avisar_handshake_concluido(dispositivo, handshake)
                 return True
-        return False
+
+            passo = None
+            limite = time.monotonic() + TIMEOUT_PASSO_HANDSHAKE_S
+            while passo is None and time.monotonic() < limite:
+                if self._parar:
+                    return None
+                texto = self._ler_linha(conexao)
+                if eh_linha_de_leitura(texto):
+                    viu_leitura = True
+                passo = handshake.receber(texto)  # None: linha que não importa agora (L, repetido, lixo...)
+            if passo is None:
+                passo = handshake.estourou_tempo()  # reenvia o comando ou desiste
+
+    def _aplicar_passo(self, conexao, dispositivo, passo: Passo):
+        """Executa um passo do handshake: troca o baud da porta, escreve a linha, avisa o operador."""
+        if passo.trocar_baud is not None:
+            conexao.baudrate = passo.trocar_baud
+            conexao.reset_input_buffer()  # joga fora qualquer ruído da troca de velocidade
+            logger.info("Baud de %s trocado para %s bps.", dispositivo, passo.trocar_baud)
+        if passo.enviar:
+            conexao.write(f"{passo.enviar}\n".encode("ascii"))
+            conexao.flush()
+            logger.info("Handshake: enviado %s (%s, %s bps).", passo.enviar, dispositivo, conexao.baudrate)
+            if passo.enviar.startswith(f"{CMD_BAUD},"):
+                self.status_msg.emit(f"Negociando {passo.enviar.split(',')[1]} bps com {dispositivo}...")
+        if passo.aviso:
+            logger.info("Handshake: %s", passo.aviso)
+            self.aviso.emit(passo.aviso, False)
+
+    def _avisar_handshake_concluido(self, dispositivo, handshake):
+        texto = (f"Handshake concluído em {dispositivo}: firmware {handshake.firmware}, "
+                 f"{BAUD_INICIAL} -> {handshake.baud_negociado} bps"
+                 + (" (a placa recusou a troca)" if handshake.fallback else "") + ".")
+        logger.info(texto)
+        self.aviso.emit(texto, False)
+
+    def _avisar_falha_do_handshake(self, dispositivo, motivo, viu_leitura):
+        texto = f"Handshake com {dispositivo} falhou: {motivo}."
+        if viu_leitura:
+            texto += " A placa manda leituras sem handshake: firmware antigo? Grave o firmware v5."
+        logger.warning(texto)
+        self.status_msg.emit(texto)
+        if texto != self._ultimo_aviso_handshake:  # um alerta por tipo de falha (não a cada varredura)
+            self._ultimo_aviso_handshake = texto
+            self.aviso.emit(texto, True)
 
     # ------------------------------------------------------------------
     # Leitura

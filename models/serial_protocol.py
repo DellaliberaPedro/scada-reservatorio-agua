@@ -16,6 +16,19 @@ Tudo é texto ASCII terminado em quebra de linha, como no protocolo usado nas au
                                E,BOTAO                               botão de emergência físico apertado: bomba cortada
                                E,BLOQUEADO                           RELE_ON recusado (acima do limite ou botão apertado)
 
+    HANDSHAKE (antes de qualquer leitura; a placa liga calada, esperando, a 9600 bps):
+
+    PC -> STM32:               HELLO                  "tem alguém aí?" (a placa responde em QUALQUER estado)
+    STM32 -> PC:               H,READY,<fw>,<bauds>   ex.: H,READY,5.0,9600;19200;38400;115200
+    PC -> STM32:               BAUD,<n>               "vamos conversar a <n> bps" (n tem de estar na lista da placa)
+    STM32 -> PC:               H,BAUD,<n>             aceito (enviado ainda no baud antigo; depois os dois trocam)
+                               H,ERRO,BAUD            recusado (baud fora da lista): segue tudo a 9600
+    PC -> STM32:               START                  "pode mandar as leituras"
+    STM32 -> PC:               H,START                a placa entra em TELEMETRIA e começa a mandar as linhas "L,"
+                               H,ERRO,<motivo>        ESTADO / COMANDO
+
+    Sem handshake a placa não manda leituras e recusa RELE_ON e LIMITE (RELE_OFF vale sempre).
+
 Uma linha corrompida NUNCA derruba o programa: interpretar_leitura() levanta
 LinhaInvalida e quem chamou decide ignorar (atividade 1 da aula de 09/11).
 """
@@ -47,6 +60,32 @@ SENSORES_DO_LIMITE = ("TDS", "TURBIDEZ", "TEMPERATURA")
 # ---------- limites de corte (PC -> STM32) ----------
 CMD_LIMITE = "LIMITE"
 LIMITE_MAXIMO_ACEITO = 10000.0  # igual ao LIMITE_MAXIMO_ACEITO do firmware: acima disso a placa ignora
+
+
+# ---------- handshake e negociação de baud ----------
+PREFIXO_HANDSHAKE = "H,"
+CMD_HELLO = "HELLO"
+CMD_BAUD = "BAUD"
+CMD_START = "START"
+BAUD_INICIAL = 9600                          # toda conversa começa aqui (a placa liga a 9600)
+BAUDS_SUPORTADOS = (9600, 19200, 38400, 115200)  # o que o SCADA sabe falar; a placa avisa os dela no H,READY
+SEPARADOR_BAUDS = ";"                        # a vírgula já separa os campos da linha
+
+
+class TipoHandshake(str, Enum):
+    READY = "READY"  # resposta ao HELLO: firmware e bauds aceitos
+    BAUD = "BAUD"    # a placa aceitou o baud pedido
+    START = "START"  # a placa começou a mandar leituras
+    ERRO = "ERRO"    # a placa recusou (motivo no campo 'motivo')
+
+
+@dataclass(frozen=True)
+class MensagemHandshake:
+    tipo: TipoHandshake
+    firmware: str | None = None
+    bauds: tuple[int, ...] = ()
+    baud: int | None = None
+    motivo: str | None = None
 
 
 class TipoEventoPlaca(str, Enum):
@@ -180,3 +219,80 @@ def interpretar_confirmacao_limite(texto: str) -> ConfirmacaoLimite:
     if not math.isfinite(valor) or valor <= 0:
         raise LinhaInvalida(f"valor inválido na confirmação do limite: {texto!r}")
     return ConfirmacaoLimite(campos[1], valor)
+
+
+# ----------------------------------------------------------------------
+# Handshake e negociação de baud
+# ----------------------------------------------------------------------
+def eh_linha_de_handshake(texto: str) -> bool:
+    return texto.startswith(PREFIXO_HANDSHAKE)
+
+
+def _inteiro_positivo(texto: str) -> int:
+    """Só dígitos e maior que zero ('9600'): recusa '', '0', '-1', '96.0', '9 600', '+5', '1e3'. Levanta ValueError."""
+    if not texto.isascii() or not texto.isdigit() or int(texto) <= 0:
+        raise ValueError(texto)
+    return int(texto)
+
+
+def interpretar_handshake(texto: str) -> MensagemHandshake:
+    """Converte 'H,READY,5.0,9600;115200', 'H,BAUD,115200', 'H,START' ou 'H,ERRO,BAUD'. Levanta LinhaInvalida."""
+    texto = texto.strip()
+    if not eh_linha_de_handshake(texto):
+        raise LinhaInvalida(f"não é uma linha de handshake: {texto!r}")
+
+    campos = texto[len(PREFIXO_HANDSHAKE):].split(",")
+    try:
+        tipo = TipoHandshake(campos[0])
+    except ValueError:
+        raise LinhaInvalida(f"mensagem de handshake desconhecida: {texto!r}") from None
+
+    if tipo is TipoHandshake.READY:
+        if len(campos) != 3 or not campos[1]:
+            raise LinhaInvalida(f"esperava H,READY,<firmware>,<bauds>: {texto!r}")
+        try:
+            bauds = tuple(_inteiro_positivo(b) for b in campos[2].split(SEPARADOR_BAUDS))
+        except ValueError:
+            raise LinhaInvalida(f"lista de bauds inválida no H,READY: {texto!r}") from None
+        return MensagemHandshake(tipo, firmware=campos[1], bauds=bauds)
+
+    if tipo is TipoHandshake.BAUD:
+        if len(campos) != 2:
+            raise LinhaInvalida(f"esperava H,BAUD,<n>: {texto!r}")
+        try:
+            baud = _inteiro_positivo(campos[1])
+        except ValueError:
+            raise LinhaInvalida(f"baud inválido no H,BAUD: {texto!r}") from None
+        return MensagemHandshake(tipo, baud=baud)
+
+    if tipo is TipoHandshake.ERRO:
+        if len(campos) != 2 or not campos[1]:
+            raise LinhaInvalida(f"esperava H,ERRO,<motivo>: {texto!r}")
+        return MensagemHandshake(tipo, motivo=campos[1])
+
+    if len(campos) != 1:  # H,START não tem campos extras
+        raise LinhaInvalida(f"o H,START não tem campos extras: {texto!r}")
+    return MensagemHandshake(tipo)
+
+
+def montar_comando_baud(baud: int) -> str:
+    """Monta 'BAUD,115200' (sem a quebra de linha). Levanta ValueError se o SCADA não fala esse baud."""
+    if type(baud) is not int or baud not in BAUDS_SUPORTADOS:  # int de verdade: nada de 9600.0 nem True
+        raise ValueError(f"baud não suportado: {baud!r} (use um de {', '.join(map(str, BAUDS_SUPORTADOS))})")
+    return f"{CMD_BAUD},{baud}"
+
+
+def escolher_baud(desejado: int, bauds_da_placa, bauds_do_pc=BAUDS_SUPORTADOS) -> int:
+    """
+    Negociação: o baud que os DOIS lados sabem falar e que mais se aproxima do desejado (sem passar dele).
+
+      - desejado está na lista dos dois        -> usa o desejado
+      - não está                               -> o maior comum que não passa do desejado
+      - nada comum abaixo do desejado          -> o menor comum
+      - nenhum em comum                        -> BAUD_INICIAL (a conversa já está acontecendo a 9600)
+    """
+    comuns = (set(bauds_da_placa) & set(bauds_do_pc)) | {BAUD_INICIAL}
+    if desejado in comuns:
+        return desejado
+    abaixo = [b for b in comuns if b <= desejado]
+    return max(abaixo) if abaixo else min(comuns)

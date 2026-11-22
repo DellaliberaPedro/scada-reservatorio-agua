@@ -375,7 +375,7 @@
          <item>
           <widget class="QLabel" name="lbl_baud_rate">
            <property name="text">
-            <string>Baud Rate:</string>
+            <string>Baud desejado:</string>
            </property>
           </widget>
          </item>
@@ -384,6 +384,16 @@
            <item>
             <property name="text">
              <string>9600</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>19200</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>38400</string>
             </property>
            </item>
            <item>

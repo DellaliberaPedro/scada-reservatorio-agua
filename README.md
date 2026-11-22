@@ -17,7 +17,7 @@ A aplicação atua como uma Interface Homem-Máquina (IHM) de supervisão, receb
 | TDS / condutividade | Sensor analógico | Sensor analógico de condutividade de água |
 | Turbidez | Sensor analógico | Sensor de turbidez para monitoramento de água |
 
-Nesta fase de desenvolvimento os dados ainda são simulados em software; a integração serial real com o STM32 (via USB) é uma etapa futura.
+Sem a placa conectada o programa roda com dados **simulados**; ao conectar o STM32 (USB) ele passa sozinho para a **leitura real** (ver *Protocolo serial e handshake* abaixo).
 
 ## Stack
 
@@ -84,6 +84,66 @@ Roteiro da arguição:
 2. **Rollback:** menu *Diagnóstico → Simular falha no próximo corte emergencial* (`Ctrl+Shift+F`) → *CORTE EMERGENCIAL* → *Yes*. A operação falha entre o UPDATE dos dispositivos e o INSERT do evento; a válvula continua **ABERTA** e nenhum evento novo aparece no histórico.
 3. **Auditoria:** *Diagnóstico → Abrir arquivo de log* (`Ctrl+L`) e mostre as linhas `[WARNING] Entrada inválida bloqueada...` e `[ERROR] Falha na operação de corte emergencial. Rollback executado: ...`.
 
+## Concorrência: três threads (Critério 1)
+
+O programa executa em **três threads** com papéis separados. Nenhuma toca no objeto da outra: conversam só por **fila** (`queue.Queue`) e por **sinais do Qt**.
+
+| Thread | Classe | O que faz |
+|---|---|---|
+| **GUI** | `MainController` (janela) | desenha a tela e trata cliques; nunca abre o SQLite depois que a janela está no ar |
+| **Serial** | `SerialWorker` (`models/serial_worker.py`) | abre a porta, faz o handshake, lê o STM32 e escreve os comandos |
+| **Banco** | `DatabaseWorker` (`models/database_worker.py`) | grava e consulta o SQLite |
+
+```
+GUI ──── queue.Queue (FIFO) ────▶ DatabaseWorker.executar()   [thread do banco]
+GUI ◀─── sinal concluido(token, resultado) ──── DatabaseWorker
+GUI ◀─── sinais (leitura_recebida, conectado, ...) ──── SerialWorker  [thread serial]
+```
+
+- A GUI chama `banco.executar("inserir_evento", evento, ao_terminar=funcao)` e a chamada **volta na hora**: só põe o pedido na fila. A tela nunca espera o disco.
+- A thread do banco atende a fila na ordem em que chegou (FIFO), uma transação por operação, e devolve um `ResultadoBanco` (erro de banco vira `ok=False`, nunca derruba a thread).
+- Só operações de uma lista fixa (`OPERACOES`) são aceitas; os argumentos são **copiados** antes de entrar na fila (nenhum objeto mutável é dividido entre threads).
+- Fechar a janela coloca um marcador de fim na fila: tudo que já foi pedido é gravado antes de a thread terminar.
+- Ao iniciar, o `logs/smartgrid.log` mostra os ids das três threads (`GUI thread`, `Thread de banco`, `Thread serial`).
+- **Com a placa conectada a tela segue o hardware na hora** (a placa confirmou, o operador vê) e o banco grava em segundo plano. No modo simulado grava primeiro e só depois muda a tela (é isso que permite a demonstração do rollback).
+- Exceção honesta: a carga inicial (regras, estado da válvula, criação das tabelas) e a escrita de `config.json`/log ainda acontecem na GUI thread, antes da janela aparecer.
+
+## Protocolo serial e handshake (Critério 2)
+
+Tudo é texto ASCII terminado em `\n`. A placa **liga calada, a 9600 baud**, e só manda leituras depois do handshake:
+
+```
+PC                                    STM32 (firmware v5)
+ │  abre a porta a 9600 bps             │  AGUARDANDO (calada, bomba desligada)
+ │── HELLO ───────────────────────────▶│
+ │◀── H,READY,5.0,9600;19200;38400;115200
+ │── BAUD,115200 ─────────────────────▶│  (n tem de estar na lista da placa)
+ │◀── H,BAUD,115200 ───────────────────│  (enviado ainda no baud antigo; depois os dois trocam)
+ │  conexao.baudrate = 115200           │
+ │── START ───────────────────────────▶│
+ │◀── H,START ─────────────────────────│  TELEMETRIA
+ │◀── L,<tds>,<turbidez>,<temperatura> ─│  a cada 2 s
+```
+
+- **Negociação:** o PC escolhe o baud que os dois lados sabem falar e que mais se aproxima do desejado na tela (`escolher_baud`). Se a placa recusar (`H,ERRO,BAUD`), a conversa **continua a 9600** (fallback). Bauds suportados: **9600, 19200, 38400, 115200**.
+- **Falhas:** cada passo reenvia o comando se a resposta não chega (4 tentativas no `HELLO`, 3 nos demais) e desiste com mensagem clara; firmware antigo (que transmite sem handshake) tem aviso próprio. Linhas corrompidas nunca derrubam o programa.
+- **Segurança:** sem handshake a placa recusa `RELE_ON` e `LIMITE` (`H,ERRO,ESTADO`); `RELE_OFF` vale sempre. Um novo `HELLO` volta a placa a AGUARDANDO com a bomba **desligada**.
+- Comandos depois do handshake: `RELE_ON`, `RELE_OFF`, `LIMITE,<TDS|TURBIDEZ|TEMPERATURA>,<valor>`; confirmações `A,...`; eventos espontâneos `E,LIMITE,<sensor>`, `E,BOTAO`, `E,BLOQUEADO`.
+- A lógica de decisão é uma **máquina de estados pura** (`models/handshake.py`, sem Qt e sem porta serial): o `SerialWorker` só faz a E/S.
+
+> **Honestidade técnica:** a Blue Pill usa a porta **USB CDC**, em que o baud é *virtual* (a velocidade real é a do USB). A negociação acontece de verdade no **protocolo** (lista, escolha, confirmação, fallback) e o PC reconfigura `baudrate` da porta, mas o número não muda o ritmo elétrico. O firmware tem a chave `SERIAL_E_USB_CDC`: com `0` (UART real, ex.: adaptador USB-TTL em PA9/PA10) a placa chama `Serial.begin(n)` de verdade.
+
+O firmware fica em `firmware/firmware_reservatorio/` (Arduino IDE + core STM32duino, gravado por ST-Link).
+
+## Testes automatizados
+
+Os testes da camada pura (protocolo e máquina de estados do handshake, sem Qt e sem porta serial) ficam em `tests/`:
+
+```bash
+pip install pytest
+python -m pytest tests -q
+```
+
 ## Sobre o .gitignore
 
 O `.gitignore` diz pro Git quais arquivos **não** devem entrar no repositório: a pasta `.venv/` (ambiente virtual — cada um cria o seu localmente), `__pycache__/` e `*.pyc` (bytecode compilado, gerado automaticamente toda vez que o programa roda) e configurações de IDE. Sem isso, esses arquivos mudam sozinhos a cada execução e geram conflito toda hora entre quem está usando o projeto. Se você clonar o projeto e não tiver esse arquivo, copia o conteúdo abaixo pra um arquivo chamado `.gitignore` na raiz:
@@ -132,7 +192,7 @@ Thumbs.db
 | Linguagem     |     Versão | Utilização                           |
 | ------------- | ---------: | ------------------------------------ |
 | 🐍 **Python** |   **3.14** | Desenvolvimento da aplicação desktop |
-| ⚙️ **C**      |    A definir | Firmware e programação do STM32      |
+| ⚙️ **C++ (Arduino)** | — | Firmware do STM32 (`firmware/`)      |
 | 🎨 **QSS**    | **Qt 6.x** | Estilização da interface gráfica     |
 
 ### 🖥️ Frameworks e bibliotecas
@@ -148,7 +208,7 @@ Thumbs.db
 | Tecnologia             | Versão / Modelo | Utilização                               |
 | ---------------------- | --------------: | ---------------------------------------- |
 | **STM32F103C8T6**      |       Blue Pill | Microcontrolador principal               |
-| **STM32CubeIDE**       |         **2.x** | Desenvolvimento e compilação do firmware |
+| **Arduino IDE + core STM32duino** |   — | Compilação do firmware (gravação por ST-Link) |
 | **DS18B20**            |               — | Sensor de temperatura                    |
 | **Sensor TDS**         |               — | Medição de condutividade/TDS             |
 | **Sensor de Turbidez** |               — | Medição da turbidez da água              |

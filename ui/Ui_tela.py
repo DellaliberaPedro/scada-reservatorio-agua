@@ -261,6 +261,8 @@ class Ui_MainWindow(object):
         self.combo_baud_rate = QComboBox(self.group_serial)
         self.combo_baud_rate.addItem("")
         self.combo_baud_rate.addItem("")
+        self.combo_baud_rate.addItem("")
+        self.combo_baud_rate.addItem("")
         self.combo_baud_rate.setObjectName(u"combo_baud_rate")
 
         self.layout_serial_config.addWidget(self.combo_baud_rate)
@@ -351,9 +353,11 @@ class Ui_MainWindow(object):
         self.combo_porta_com.setItemText(1, QCoreApplication.translate("MainWindow", u"COM3", None))
         self.combo_porta_com.setItemText(2, QCoreApplication.translate("MainWindow", u"COM5", None))
 
-        self.lbl_baud_rate.setText(QCoreApplication.translate("MainWindow", u"Baud Rate:", None))
+        self.lbl_baud_rate.setText(QCoreApplication.translate("MainWindow", u"Baud desejado:", None))
         self.combo_baud_rate.setItemText(0, QCoreApplication.translate("MainWindow", u"9600", None))
-        self.combo_baud_rate.setItemText(1, QCoreApplication.translate("MainWindow", u"115200", None))
+        self.combo_baud_rate.setItemText(1, QCoreApplication.translate("MainWindow", u"19200", None))
+        self.combo_baud_rate.setItemText(2, QCoreApplication.translate("MainWindow", u"38400", None))
+        self.combo_baud_rate.setItemText(3, QCoreApplication.translate("MainWindow", u"115200", None))
 
         self.lbl_timeout.setText(QCoreApplication.translate("MainWindow", u"Timeout (s):", None))
         self.btn_conectar.setText(QCoreApplication.translate("MainWindow", u"Conectar", None))
